@@ -628,3 +628,191 @@ class TestCassandraExtraModelArguments:
             NflxCassandraCapacityModel.get_required_cluster_size(
                 tier, extra_model_arguments
             )
+
+
+class TestFamilySwitchingRegret:
+    """Tests for the family switching regret feature"""
+
+    def test_current_family_in_requirement_context(self):
+        """Verify that current_family is stored in requirement context"""
+        cluster_capacity = CurrentZoneClusterCapacity(
+            cluster_instance_name="i3.xlarge",
+            cluster_instance_count=Interval(low=4, mid=4, high=4, confidence=1),
+            cpu_utilization=certain_float(50),
+            memory_utilization_gib=certain_float(16.0),
+            disk_utilization_gib=certain_float(400),
+            network_utilization_mbps=certain_float(500),
+        )
+
+        desires = CapacityDesires(
+            service_tier=1,
+            current_clusters=CurrentClusters(zonal=[cluster_capacity]),
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+            extra_model_arguments={"required_cluster_size": 4},
+        )
+
+        # Verify current_family is in the requirement context
+        assert len(cap_plan) > 0
+        requirement = cap_plan[0].requirements.zonal[0]
+        assert "current_family" in requirement.context
+        assert requirement.context["current_family"] == "i3"
+
+    def test_family_switch_in_regrets(self):
+        """Verify that family_switch is included in regrets tuple"""
+        cluster_capacity = CurrentZoneClusterCapacity(
+            cluster_instance_name="i3.xlarge",
+            cluster_instance_count=Interval(low=4, mid=4, high=4, confidence=1),
+            cpu_utilization=certain_float(50),
+            memory_utilization_gib=certain_float(16.0),
+            disk_utilization_gib=certain_float(400),
+            network_utilization_mbps=certain_float(500),
+        )
+
+        desires = CapacityDesires(
+            service_tier=1,
+            current_clusters=CurrentClusters(zonal=[cluster_capacity]),
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+            extra_model_arguments={"required_cluster_size": 4},
+        )
+
+        # Verify family_switch is in the regrets
+        assert len(cap_plan) > 0
+        assert "family_switch" in cap_plan[0].requirements.regrets
+
+    def test_no_current_family_when_no_current_cluster(self):
+        """Verify current_family is None when there's no current cluster"""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+        )
+
+        # Verify current_family is None
+        assert len(cap_plan) > 0
+        requirement = cap_plan[0].requirements.zonal[0]
+        assert "current_family" in requirement.context
+        assert requirement.context["current_family"] is None
+
+    def test_large_shape_in_regrets(self):
+        """Verify that large_shape is included in regrets tuple"""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+        )
+
+        # Verify large_shape is in the regrets
+        assert len(cap_plan) > 0
+        assert "large_shape" in cap_plan[0].requirements.regrets
+
+    def test_penalty_configuration_in_context(self):
+        """Verify penalty configuration is stored in requirement context"""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        # Test with custom penalty values
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+            extra_model_arguments={
+                "family_switch_penalty": 0.25,
+                "large_shape_penalty": 0.30,
+                "large_shape_threshold": 12,
+            },
+        )
+
+        assert len(cap_plan) > 0
+        context = cap_plan[0].requirements.zonal[0].context
+
+        # Verify custom penalty values are in context
+        assert context["family_switch_penalty"] == 0.25
+        assert context["large_shape_penalty"] == 0.30
+        assert context["large_shape_threshold"] == 12
+
+    def test_default_penalty_values_in_context(self):
+        """Verify default penalty values when not specified"""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(10_000),
+                estimated_write_per_second=certain_int(1_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(100),
+            ),
+        )
+
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            num_results=1,
+            desires=desires,
+        )
+
+        assert len(cap_plan) > 0
+        context = cap_plan[0].requirements.zonal[0].context
+
+        # Verify default penalty values
+        assert context["family_switch_penalty"] == 0.15
+        assert context["large_shape_penalty"] == 0.20
+        assert context["large_shape_threshold"] == 12

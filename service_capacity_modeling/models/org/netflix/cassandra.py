@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 import logging
 import math
 from typing import Any
@@ -16,6 +17,7 @@ from service_capacity_modeling.interface import BufferComponent
 from service_capacity_modeling.interface import Buffers
 from service_capacity_modeling.interface import CapacityDesires
 from service_capacity_modeling.interface import CapacityPlan
+from service_capacity_modeling.interface import CapacityRegretParameters
 from service_capacity_modeling.interface import CapacityRequirement
 from service_capacity_modeling.interface import certain_float
 from service_capacity_modeling.interface import certain_int
@@ -28,7 +30,9 @@ from service_capacity_modeling.interface import FixedInterval
 from service_capacity_modeling.interface import GlobalConsistency
 from service_capacity_modeling.interface import Instance
 from service_capacity_modeling.interface import Interval
+from service_capacity_modeling.interface import normalized_aws_size
 from service_capacity_modeling.interface import QueryPattern
+from service_capacity_modeling.interface import Regret
 from service_capacity_modeling.interface import RegionContext
 from service_capacity_modeling.interface import Requirements
 from service_capacity_modeling.interface import ServiceCapacity
@@ -194,6 +198,9 @@ def _estimate_cassandra_requirement(
     max_rps_to_disk: int,
     zones_per_region: int = 3,
     copies_per_region: int = 3,
+    family_switch_penalty: float = 0.15,
+    large_shape_penalty: float = 0.20,
+    large_shape_threshold: int = 12,
 ) -> CapacityRequirement:
     """Estimate the capacity required for one zone given a regional desire
 
@@ -306,6 +313,13 @@ def _estimate_cassandra_requirement(
         working_set,
     )
 
+    # Extract current family for family switching regret
+    current_family = (
+        current_capacity.cluster_instance.family
+        if current_capacity and current_capacity.cluster_instance
+        else None
+    )
+
     return CapacityRequirement(
         requirement_type="cassandra-zonal",
         reference_shape=reference_shape,
@@ -324,6 +338,11 @@ def _estimate_cassandra_requirement(
             "read_per_second": reads_per_second,
             "write_buffer_gib": write_buffer_gib,
             "min_threshold": min_threshold,
+            "current_family": current_family,
+            # Regret penalty configuration (tunable via extra_model_arguments)
+            "family_switch_penalty": family_switch_penalty,
+            "large_shape_penalty": large_shape_penalty,
+            "large_shape_threshold": large_shape_threshold,
         },
     )
 
@@ -386,6 +405,9 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     max_regional_size: int = 192,
     max_write_buffer_percent: float = 0.25,
     max_table_buffer_percent: float = 0.11,
+    family_switch_penalty: float = 0.15,
+    large_shape_penalty: float = 0.20,
+    large_shape_threshold: int = 12,
 ) -> Optional[CapacityPlan]:
     # Netflix Cassandra doesn't like to deploy on really small instances
     if instance.cpu < 2 or instance.ram_gib < 14:
@@ -443,6 +465,9 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         max_rps_to_disk=max_rps_to_disk,
         zones_per_region=zones_per_region,
         copies_per_region=copies_per_region,
+        family_switch_penalty=family_switch_penalty,
+        large_shape_penalty=large_shape_penalty,
+        large_shape_threshold=large_shape_threshold,
     )
 
     # Adjust the min count to adjust to prevent too much data on a single
@@ -572,7 +597,10 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     )
 
     return CapacityPlan(
-        requirements=Requirements(zonal=[requirement] * zones_per_region),
+        requirements=Requirements(
+            zonal=[requirement] * zones_per_region,
+            regrets=("spend", "disk", "family_switch", "large_shape"),
+        ),
         candidate_clusters=clusters,
     )
 
@@ -689,6 +717,24 @@ class NflxCassandraArguments(BaseModel):
         "Note that if there are more than 100k writes this will "
         "automatically adjust to 0.2",
     )
+    family_switch_penalty: float = Field(
+        default=0.15,
+        description="Cost penalty (as fraction) for switching instance families. "
+        "For example, 0.15 means a 15% penalty is added to the plan cost "
+        "when evaluating regret for switching from current family.",
+    )
+    large_shape_penalty: float = Field(
+        default=0.20,
+        description="Cost penalty (as fraction) for using large instance shapes. "
+        "For example, 0.20 means a 20% penalty is added for shapes >= "
+        "large_shape_threshold xlarge units.",
+    )
+    large_shape_threshold: int = Field(
+        default=12,
+        description="Instance size threshold (in xlarge units) at or above which the "
+        "large_shape_penalty applies. Default 12 means 12xlarge and larger "
+        "are penalized (e.g., 12xlarge, 16xlarge, 24xlarge).",
+    )
 
     @classmethod
     def from_extra_model_arguments(
@@ -792,7 +838,82 @@ class NflxCassandraCapacityModel(CapacityModel):
             max_local_data_per_node_gib=args.max_local_data_per_node_gib,
             max_write_buffer_percent=max_write_buffer_percent,
             max_table_buffer_percent=max_table_buffer_percent,
+            family_switch_penalty=args.family_switch_penalty,
+            large_shape_penalty=args.large_shape_penalty,
+            large_shape_threshold=args.large_shape_threshold,
         )
+
+    @staticmethod
+    def regret(
+        regret_params: CapacityRegretParameters,
+        optimal_plan: CapacityPlan,
+        proposed_plan: CapacityPlan,
+    ) -> Dict[str, float]:
+        """Calculate regret including family switching and large shape penalties.
+
+        In addition to the standard spend/disk/mem regrets, this adds:
+        - 'family_switch' regret when switching instance families
+        - 'large_shape' regret when using large instances (>= threshold xlarge)
+
+        Both penalties are configurable via extra_model_arguments:
+        - family_switch_penalty: fraction penalty for switching (default 0.15)
+        - large_shape_penalty: fraction penalty for large shapes (default 0.20)
+        - large_shape_threshold: xlarge units above which penalty applies (default 12)
+        """
+        # Get base regrets from parent
+        regrets = CapacityModel.regret(regret_params, optimal_plan, proposed_plan)
+
+        if not optimal_plan.requirements.zonal:
+            return regrets
+
+        context = optimal_plan.requirements.zonal[0].context
+        plan_cost = float(proposed_plan.candidate_clusters.total_annual_cost)
+
+        # Get configurable penalty values from context (set via extra_model_arguments)
+        family_switch_penalty = context.get("family_switch_penalty", 0.15)
+        large_shape_penalty = context.get("large_shape_penalty", 0.20)
+        large_shape_threshold = context.get("large_shape_threshold", 12)
+
+        # Family switching regret
+        current_family = context.get("current_family")
+        if current_family and proposed_plan.candidate_clusters.zonal:
+            proposed_family = proposed_plan.candidate_clusters.zonal[0].instance.family
+            if current_family != proposed_family:
+                # Apply penalty for switching families
+                switch_regret = regret_params.extra.get(
+                    "family_switch",
+                    Regret(
+                        over_provision_cost=family_switch_penalty,
+                        under_provision_cost=family_switch_penalty,
+                        exponent=1.0,
+                    ),
+                )
+                regrets["family_switch"] = plan_cost * switch_regret.over_provision_cost
+
+        # Large shape regret
+        if proposed_plan.candidate_clusters.zonal:
+            proposed_instance = proposed_plan.candidate_clusters.zonal[0].instance
+            # Use normalized_aws_size to get xlarge units (e.g., 12xlarge -> 12)
+            try:
+                xlarge_units = float(normalized_aws_size(proposed_instance.name))
+                if xlarge_units >= large_shape_threshold:
+                    # Apply penalty for large shapes
+                    shape_regret = regret_params.extra.get(
+                        "large_shape",
+                        Regret(
+                            over_provision_cost=large_shape_penalty,
+                            under_provision_cost=large_shape_penalty,
+                            exponent=1.0,
+                        ),
+                    )
+                    regrets["large_shape"] = (
+                        plan_cost * shape_regret.over_provision_cost
+                    )
+            except (ValueError, IndexError):
+                # If we can't parse the instance size, skip the large shape check
+                pass
+
+        return regrets
 
     @staticmethod
     def description() -> str:
