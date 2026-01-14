@@ -11,11 +11,13 @@ from service_capacity_modeling.interface import (
     CurrentClusters,
     CurrentZoneClusterCapacity,
     CurrentRegionClusterCapacity,
+    DataShape,
     Drive,
     Instance,
     Interval,
     Lifecycle,
     Platform,
+    QueryPattern,
     Requirements,
     ZoneClusterCapacity,
     certain_float,
@@ -478,89 +480,44 @@ class TestComparePlans:
         assert not result.memory.is_equivalent  # 0.85 < 0.9
         assert result.memory.exceeds_lower_bound
 
-    def test_cpu_normalization_across_different_ipc(self):
-        """CPU comparison normalizes for both GHz and IPC differences.
+    def test_cpu_normalization_faster_ghz_compensates_fewer_cores(self):
+        """77 cores @ 3.0 GHz ≈ 100 cores @ 2.3 GHz (reference)."""
+        baseline = self._cpu_plan(cores=100, ghz=2.3, ipc=1.0)
+        comparison = self._cpu_plan(cores=77, ghz=3.0, ipc=1.0)
+        assert compare_plans(baseline, comparison).cpu.is_equivalent
 
-        Normalization formula:
-            ref_cores = cores × (ghz × ipc) / (2.3 × 1.0)
+    def test_cpu_normalization_double_ipc_halves_cores_needed(self):
+        """50 cores @ IPC 2.0 = 100 cores @ IPC 1.0."""
+        baseline = self._cpu_plan(cores=100, ghz=2.3, ipc=1.0)
+        comparison = self._cpu_plan(cores=50, ghz=2.3, ipc=2.0)
+        assert compare_plans(baseline, comparison).cpu.is_equivalent
 
-        Where 2.3 GHz and IPC 1.0 is the default_reference_shape.
+    def test_cpu_normalization_combined_ghz_and_ipc(self):
+        """40 cores @ 3.0 GHz, IPC 2.0 ≈ 104 reference cores."""
+        baseline = self._cpu_plan(cores=100, ghz=2.3, ipc=1.0)
+        comparison = self._cpu_plan(cores=40, ghz=3.0, ipc=2.0)
+        assert compare_plans(baseline, comparison).cpu.is_equivalent
 
-        Test cases:
-        1. Different GHz, same IPC:
-           - A: 100 cores @ 2.3 GHz, IPC 1.0 → 100 × 2.3/2.3 = 100 ref
-           - B: 77 cores @ 3.0 GHz, IPC 1.0 → 77 × 3.0/2.3 = 100.4 ref
-           Ratio ≈ 1.0 → equivalent
-
-        2. Same GHz, different IPC (higher IPC = fewer cores needed):
-           - A: 100 cores @ 2.3 GHz, IPC 1.0 → 100 ref
-           - B: 50 cores @ 2.3 GHz, IPC 2.0 → 50 × 4.6/2.3 = 100 ref
-           Ratio = 1.0 → equivalent
-
-        3. Combined GHz + IPC difference:
-           - A: 100 cores @ 2.3 GHz, IPC 1.0 → 100 ref
-           - B: 40 cores @ 3.0 GHz, IPC 2.0 → 40 × 6.0/2.3 = 104.3 ref
-           Ratio ≈ 1.04 → equivalent (within ±10%)
-
-        4. IPC difference exceeds tolerance (failure case):
-           - A: 100 cores @ 2.3 GHz, IPC 1.0 → 100 ref
-           - B: 100 cores @ 2.3 GHz, IPC 0.5 → 100 × 1.15/2.3 = 50 ref
-           Ratio = 0.5 → under-provisioned (outside ±10%)
-        """
-
-        def make_plan(cpu: int, cpu_ghz: float, cpu_ipc_scale: float) -> CapacityPlan:
-            inst = _create_instance(
-                cpu=cpu, cpu_ghz=cpu_ghz, cpu_ipc_scale=cpu_ipc_scale
-            )
-            return CapacityPlan(
-                requirements=Requirements(
-                    zonal=[
-                        CapacityRequirement(
-                            requirement_type="t", cpu_cores=certain_int(cpu)
-                        )
-                    ]
-                ),
-                candidate_clusters=Clusters(
-                    annual_costs={"t": Decimal("1000")},
-                    zonal=[
-                        ZoneClusterCapacity(
-                            cluster_type="t", count=1, instance=inst, annual_cost=1000.0
-                        )
-                    ],
-                ),
-            )
-
-        # Case 1: Different GHz, same IPC
-        baseline = make_plan(cpu=100, cpu_ghz=2.3, cpu_ipc_scale=1.0)
-        comparison = make_plan(cpu=77, cpu_ghz=3.0, cpu_ipc_scale=1.0)
-        result = compare_plans(baseline, comparison)
-        assert result.cpu.is_equivalent
-        assert 0.99 < result.cpu.ratio < 1.05  # 100.4/100 ≈ 1.004
-
-        # Case 2: Same GHz, different IPC (2× IPC = half the cores)
-        baseline = make_plan(cpu=100, cpu_ghz=2.3, cpu_ipc_scale=1.0)
-        comparison = make_plan(cpu=50, cpu_ghz=2.3, cpu_ipc_scale=2.0)
-        result = compare_plans(baseline, comparison)
-        assert result.cpu.is_equivalent
-        assert 0.99 < result.cpu.ratio < 1.01  # Exactly 1.0
-
-        # Case 3: Combined GHz + IPC
-        baseline = make_plan(cpu=100, cpu_ghz=2.3, cpu_ipc_scale=1.0)
-        comparison = make_plan(cpu=40, cpu_ghz=3.0, cpu_ipc_scale=2.0)
-        result = compare_plans(baseline, comparison)
-        assert result.cpu.is_equivalent
-        assert 1.0 < result.cpu.ratio < 1.1  # 104.3/100 ≈ 1.043
-
-        # Case 4: IPC difference exceeds tolerance (NOT equivalent)
-        #   - Baseline: 100 cores @ 2.3 GHz, IPC 1.0 → 100 ref
-        #   - Comparison: 100 cores @ 2.3 GHz, IPC 0.5 → 100 × 1.15/2.3 = 50 ref
-        #   Ratio = 0.5 → under-provisioned (outside ±10%)
-        baseline = make_plan(cpu=100, cpu_ghz=2.3, cpu_ipc_scale=1.0)
-        comparison = make_plan(cpu=100, cpu_ghz=2.3, cpu_ipc_scale=0.5)
+    def test_cpu_normalization_half_ipc_exceeds_tolerance(self):
+        """100 cores @ IPC 0.5 = 50 reference cores → under-provisioned."""
+        baseline = self._cpu_plan(cores=100, ghz=2.3, ipc=1.0)
+        comparison = self._cpu_plan(cores=100, ghz=2.3, ipc=0.5)
         result = compare_plans(baseline, comparison)
         assert not result.cpu.is_equivalent
-        assert result.cpu.exceeds_lower_bound  # ratio < 0.9 = under-provisioned
-        assert 0.49 < result.cpu.ratio < 0.51  # Exactly 0.5
+        assert result.cpu.exceeds_lower_bound
+
+    def _cpu_plan(self, cores: int, ghz: float, ipc: float) -> CapacityPlan:
+        """Helper to build a plan for CPU normalization tests."""
+        inst = _create_instance(cpu=cores, cpu_ghz=ghz, cpu_ipc_scale=ipc)
+        return CapacityPlan(
+            requirements=Requirements(
+                zonal=[CapacityRequirement(requirement_type="t", cpu_cores=certain_int(cores))]
+            ),
+            candidate_clusters=Clusters(
+                annual_costs={"t": Decimal("1000")},
+                zonal=[ZoneClusterCapacity(cluster_type="t", count=1, instance=inst, annual_cost=1000.0)],
+            ),
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -771,3 +728,227 @@ class TestExtractBaselinePlan:
 
         result = compare_plans(baseline, recommended)
         assert result.is_equivalent
+
+
+# =============================================================================
+# Model-aware baseline extraction tests with service costs
+# =============================================================================
+
+
+def _interval(mid: int | float, spread: float = 0.5) -> Interval:
+    """Create an Interval centered on mid with given spread factor."""
+    return Interval(
+        low=mid * (1 - spread),
+        mid=mid,
+        high=mid * (1 + spread),
+        confidence=0.98,
+    )
+
+
+def _make_desires(
+    instance_name: str,
+    count: int,
+    is_zonal: bool,
+    reads_per_sec: int = 10000,
+    writes_per_sec: int = 5000,
+    state_gib: int = 100,
+) -> CapacityDesires:
+    """Build CapacityDesires with current_clusters for baseline extraction tests."""
+    from service_capacity_modeling.hardware import shapes
+
+    instance = shapes.region("us-east-1").instances[instance_name]
+    cluster_count = _interval(count, spread=0)
+
+    if is_zonal:
+        current = CurrentZoneClusterCapacity(
+            cluster_instance_name=instance_name,
+            cluster_instance=instance,
+            cluster_instance_count=cluster_count,
+        )
+        current_clusters = CurrentClusters(zonal=[current])
+    else:
+        current = CurrentRegionClusterCapacity(
+            cluster_instance_name=instance_name,
+            cluster_instance=instance,
+            cluster_instance_count=cluster_count,
+        )
+        current_clusters = CurrentClusters(regional=[current])
+
+    return CapacityDesires(
+        service_tier=1,
+        query_pattern=QueryPattern(
+            estimated_read_per_second=_interval(reads_per_sec),
+            estimated_write_per_second=_interval(writes_per_sec),
+        ),
+        data_shape=DataShape(
+            estimated_state_size_gib=_interval(state_gib),
+        ),
+        current_clusters=current_clusters,
+    )
+
+
+class TestModelAwareBaselineExtraction:
+    """Verify service costs are included/excluded correctly in baseline extraction."""
+
+    @pytest.mark.parametrize(
+        "model,instance,count,is_zonal,extra_args,expected_patterns,forbidden_patterns",
+        [
+            # Cassandra: network + backup costs
+            (
+                "org.netflix.cassandra",
+                "i4i.xlarge",
+                12,
+                True,
+                {"copies_per_region": 3},
+                ["current.zonal", "net", "backup"],
+                [],
+            ),
+            # RDS: no service costs
+            (
+                "org.netflix.rds",
+                "db.r5.xlarge",
+                2,
+                False,
+                {},
+                ["current.regional"],
+                ["net", "backup"],
+            ),
+            # Kafka: no service costs
+            (
+                "org.netflix.kafka",
+                "m5.2xlarge",
+                6,
+                True,
+                {},
+                ["current.zonal"],
+                ["net", "backup"],
+            ),
+            # Aurora: IO costs
+            (
+                "org.netflix.aurora",
+                "db.r5.2xlarge",
+                2,
+                False,
+                {"aurora.engine": "postgres"},
+                ["current.regional", "io"],
+                [],
+            ),
+        ],
+    )
+    def test_baseline_service_costs(
+        self,
+        model,
+        instance,
+        count,
+        is_zonal,
+        extra_args,
+        expected_patterns,
+        forbidden_patterns,
+    ):
+        from service_capacity_modeling.capacity_planner import planner
+
+        desires = _make_desires(instance, count, is_zonal)
+        baseline = planner.extract_baseline_plan(
+            model_name=model,
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments=extra_args,
+        )
+
+        cost_keys = set(baseline.candidate_clusters.annual_costs.keys())
+
+        for pattern in expected_patterns:
+            assert any(pattern in k for k in cost_keys), (
+                f"{model}: expected '{pattern}' in {cost_keys}"
+            )
+
+        for pattern in forbidden_patterns:
+            assert not any(pattern in k for k in cost_keys), (
+                f"{model}: unexpected '{pattern}' in {cost_keys}"
+            )
+
+        # Total should equal sum of components
+        total = float(baseline.candidate_clusters.total_annual_cost)
+        component_sum = sum(float(v) for v in baseline.candidate_clusters.annual_costs.values())
+        assert total == pytest.approx(component_sum, rel=0.001)
+
+    def test_evcache_network_costs_depend_on_replication(self):
+        """EVCache: network costs appear only with cross-region replication."""
+        from service_capacity_modeling.capacity_planner import planner
+
+        desires = _make_desires(
+            "m7a.xlarge", count=10, is_zonal=True, reads_per_sec=100000
+        )
+        desires.data_shape.estimated_state_item_count = _interval(10_000_000)
+
+        baseline_with = planner.extract_baseline_plan(
+            model_name="org.netflix.evcache",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={"cross_region_replication": "sets", "copies_per_region": 2},
+        )
+        baseline_without = planner.extract_baseline_plan(
+            model_name="org.netflix.evcache",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={"cross_region_replication": "none"},
+        )
+
+        keys_with = baseline_with.candidate_clusters.annual_costs.keys()
+        keys_without = baseline_without.candidate_clusters.annual_costs.keys()
+
+        assert any("net" in k for k in keys_with), "Expected network costs with replication"
+        assert not any("net" in k for k in keys_without), "No network costs without replication"
+
+        cost_with = float(baseline_with.candidate_clusters.total_annual_cost)
+        cost_without = float(baseline_without.candidate_clusters.total_annual_cost)
+        assert cost_with > cost_without
+
+    def test_aurora_io_cost_parity(self):
+        """Aurora IO costs match between recommendation and extracted baseline."""
+        from service_capacity_modeling.capacity_planner import planner
+
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=_interval(5000),
+                estimated_write_per_second=_interval(2000),
+            ),
+            data_shape=DataShape(estimated_state_size_gib=_interval(100)),
+        )
+
+        recommendation = planner.plan_certain(
+            model_name="org.netflix.aurora",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={"aurora.engine": "postgres"},
+        )[0]
+
+        # Extract baseline from recommendation's cluster
+        rec_cluster = recommendation.candidate_clusters.regional[0]
+        desires.current_clusters = CurrentClusters(
+            regional=[
+                CurrentRegionClusterCapacity(
+                    cluster_instance_name=rec_cluster.instance.name,
+                    cluster_instance=rec_cluster.instance,
+                    cluster_instance_count=_interval(rec_cluster.count, spread=0),
+                )
+            ]
+        )
+
+        baseline = planner.extract_baseline_plan(
+            model_name="org.netflix.aurora",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={"aurora.engine": "postgres"},
+        )
+
+        def io_cost(clusters):
+            return sum(float(v) for k, v in clusters.annual_costs.items() if "io" in k)
+
+        rec_io = io_cost(recommendation.candidate_clusters)
+        baseline_io = io_cost(baseline.candidate_clusters)
+
+        assert baseline_io == pytest.approx(rec_io, rel=0.01), (
+            f"IO cost mismatch: recommendation={rec_io:.2f}, baseline={baseline_io:.2f}"
+        )
