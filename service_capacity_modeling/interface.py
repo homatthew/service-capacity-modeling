@@ -536,7 +536,22 @@ class Service(ExcludeUnsetModel):
 
 
 class RegionContext(ExcludeUnsetModel):
+    """Context for a region including pricing and configuration.
+
+    This provides all the contextual information that models need to calculate
+    costs, including service pricing (network, blob storage), drive pricing
+    (for IO costs), and region configuration.
+    """
+
+    region: str = ""
+    """The AWS region name (e.g., 'us-east-1'). Empty string if not set."""
+
     services: Dict[str, Service] = {}
+    """Service pricing (network, blob storage, etc.)"""
+
+    drives: Dict[str, Drive] = {}
+    """Drive pricing and specs (for IO cost calculations)"""
+
     zones_in_region: int = 3
     num_regions: int = 3
 
