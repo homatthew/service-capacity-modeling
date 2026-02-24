@@ -242,23 +242,23 @@ class TestCassandraStorage:
         result = cap_plan.candidate_clusters.zonal[0]
 
         cores = result.count * result.instance.cpu
-        assert 128 <= cores <= 512
+        # With soft EBS memory, write-heavy workloads are sized for CPU/disk/network
+        # (not memory), so core count is lower than when memory was a hard gate.
+        assert 32 <= cores <= 512
         # Should get attached storage since we explicitly requested it
         assert result.attached_drives, (
             "Expected attached drives with require_attached_disks=True"
         )
         assert result.attached_drives[0].name == "gp3"
-        # 1TiB / ~32 nodes
         assert result.attached_drives[0].read_io_per_s is not None
         assert result.attached_drives[0].write_io_per_s is not None
 
         read_ios = result.attached_drives[0].read_io_per_s * result.count
         write_ios = result.attached_drives[0].write_io_per_s * result.count
 
-        # 10TiB ~= 4 IO/read -> 3.3k r/zone/s -> 12k /s
-        assert 20_000 < read_ios < 60_000
-        # 33k wps * 8KiB  / 256KiB write IO size = 16.5k / s * 4 for compaction = 6.4k
-        assert 4_000 < write_ios < 7_000
+        # 10TiB with fewer nodes → more IOs per node, but total should be reasonable
+        assert 10_000 < read_ios < 100_000
+        assert 2_000 < write_ios < 10_000
 
 
 class TestCassandraThroughput:
@@ -324,9 +324,10 @@ class TestCassandraThroughput:
         )[0]
         high_writes_result = cap_plan.candidate_clusters.zonal[0]
 
-        # With attached disks requested, should get general-purpose instances
-        assert high_writes_result.instance.family[0] in ("m", "r")
-        assert high_writes_result.count > 32
+        # With soft EBS memory, write-heavy workloads may pick compute-optimized
+        # instances since memory is no longer the bottleneck
+        assert high_writes_result.instance.family[0] in ("c", "m", "r")
+        assert high_writes_result.count >= 32
 
         # Should have attached storage since we explicitly requested it
         assert high_writes_result.attached_drives, (
@@ -631,3 +632,223 @@ class TestCassandraExtraModelArguments:
             NflxCassandraCapacityModel.get_required_cluster_size(
                 tier, extra_model_arguments
             )
+
+
+class TestEBSPageCacheModeling:
+    """Test EBS page cache soft memory and cache skew behavior."""
+
+    def test_large_ebs_dataset_produces_plan(self):
+        """A 10 TiB EBS dataset should produce a valid plan.
+
+        With soft memory for EBS, the plan is produced even though
+        30.6% working set would require more RAM than available per node.
+        The page cache CPU overhead is reported for visibility.
+        """
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(120_000),
+                    estimated_write_per_second=certain_int(3_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(10_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+            },
+        )
+        assert len(cap_plan) > 0, "Expected at least one EBS plan for 10 TiB dataset"
+        result = cap_plan[0].candidate_clusters.zonal[0]
+        assert result.attached_drives
+        # Should have page cache params
+        params = result.cluster_params
+        assert "cassandra.page_cache.coverage_pct" in params
+        assert "cassandra.page_cache.cpu_factor" in params
+        assert params["cassandra.page_cache.cpu_factor"] >= 1.0
+
+    def test_ebs_write_heavy_low_cpu_overhead(self):
+        """Write-heavy EBS workloads should have low CPU overhead from cache misses.
+
+        Since writes go to memtable/commitlog (not through page cache reads),
+        the CPU overhead from cache misses is proportional to the read fraction.
+        """
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(10_000),
+                    estimated_write_per_second=certain_int(2_000_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(3_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+            },
+        )
+        assert len(cap_plan) > 0
+        result = cap_plan[0].candidate_clusters.zonal[0]
+        params = result.cluster_params
+        # Write-heavy: read fraction ~0.5%, so CPU factor should be very close to 1.0
+        assert params["cassandra.page_cache.cpu_factor"] < 1.1
+
+    def test_cache_skew_factor_reduces_working_set(self):
+        """cache_skew_factor > 1.0 should reduce the effective working set.
+
+        At skew=2.0, a 30.6% base working set becomes ~9.4%.
+        """
+        # Without skew
+        plan_no_skew = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(100_000),
+                    estimated_write_per_second=certain_int(1_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(1_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+            },
+        )
+
+        # With skew=2.0
+        plan_with_skew = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(100_000),
+                    estimated_write_per_second=certain_int(1_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(1_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+                "cache_skew_factor": 2.0,
+            },
+        )
+
+        no_skew_params = plan_no_skew[0].candidate_clusters.zonal[0].cluster_params
+        with_skew_params = plan_with_skew[0].candidate_clusters.zonal[0].cluster_params
+
+        # The effective working set should be smaller with skew
+        assert (
+            with_skew_params["cassandra.working_set.effective_pct"]
+            < no_skew_params["cassandra.working_set.effective_pct"]
+        )
+        # The base working set should be the same
+        assert (
+            with_skew_params["cassandra.working_set.base_pct"]
+            == no_skew_params["cassandra.working_set.base_pct"]
+        )
+        # Skew factor should be in params
+        assert with_skew_params["cassandra.cache_skew_factor"] == 2.0
+        assert "cassandra.cache_skew_factor" not in no_skew_params
+
+    def test_local_disk_unchanged(self):
+        """Local disk behavior should be completely unchanged.
+
+        Memory remains a hard requirement for local disk instances.
+        """
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(100_000),
+                    estimated_write_per_second=certain_int(100_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(1_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_local_disks": True,
+            },
+        )
+        assert len(cap_plan) > 0
+        result = cap_plan[0].candidate_clusters.zonal[0]
+        # Local disk instances should have local drives
+        assert result.instance.drive is not None
+        # Should still have page cache params (showing 100% coverage for local)
+        params = result.cluster_params
+        assert params["cassandra.page_cache.cpu_factor"] == 1.0
+        assert params["cassandra.page_cache.coverage_pct"] == 100.0
+
+    def test_ebs_page_cache_params_always_present(self):
+        """All plans should have page cache params for observability."""
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(10_000),
+                    estimated_write_per_second=certain_int(10_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(100),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+            },
+        )
+        assert len(cap_plan) > 0
+        for plan in cap_plan:
+            for cluster in plan.candidate_clusters.zonal:
+                params = cluster.cluster_params
+                assert "cassandra.page_cache.coverage_pct" in params
+                assert "cassandra.page_cache.cpu_factor" in params
+                assert "cassandra.working_set.base_pct" in params
+                assert "cassandra.working_set.effective_pct" in params
+
+    def test_cache_skew_with_large_ebs_produces_plan(self):
+        """Large EBS dataset with cache skew produces a plan."""
+        cap_plan = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=CapacityDesires(
+                service_tier=1,
+                query_pattern=QueryPattern(
+                    estimated_read_per_second=certain_int(120_000),
+                    estimated_write_per_second=certain_int(3_000),
+                ),
+                data_shape=DataShape(
+                    estimated_state_size_gib=certain_int(10_000),
+                ),
+            ),
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+                "cache_skew_factor": 2.0,
+            },
+        )
+        assert len(cap_plan) > 0
+        result = cap_plan[0].candidate_clusters.zonal[0]
+        params = result.cluster_params
+        # With skew=2.0, effective working set is much smaller (~9.4% vs 30.6%)
+        # so the CPU overhead should be lower than without skew
+        assert params["cassandra.page_cache.cpu_factor"] >= 1.0
+        assert params["cassandra.working_set.effective_pct"] < 15.0

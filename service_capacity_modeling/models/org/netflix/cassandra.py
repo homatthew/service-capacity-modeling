@@ -8,6 +8,7 @@ from typing import List
 from typing import Optional
 from typing import Sequence
 from typing import Set
+from typing import Tuple
 
 from pydantic import BaseModel
 from pydantic import Field
@@ -59,6 +60,27 @@ from service_capacity_modeling.stats import dist_for_interval
 logger = logging.getLogger(__name__)
 
 BACKGROUND_BUFFER = "background"
+
+
+def _cache_hit_rate(cache_fraction: float, skew_factor: float = 1.0) -> float:
+    """Estimate cache hit rate given the fraction of data in cache and access skew.
+
+    Under uniform access (skew=1.0): hit_rate = cache_fraction
+    Under Zipfian skew: hit_rate = cache_fraction^(1/skew_factor)
+
+    Higher skew_factor means more skewed access — a smaller cache covers more reads.
+    Grounded in Zipfian distribution theory where a fraction f of items cached
+    serves f^(1/alpha) of requests for Zipf parameter alpha.
+    """
+    if cache_fraction >= 1.0:
+        return 1.0
+    if cache_fraction <= 0.0:
+        return 0.0
+    if skew_factor <= 1.0:
+        return cache_fraction
+    return float(min(1.0, cache_fraction ** (1.0 / skew_factor)))
+
+
 CRITICAL_TIERS: Set[int] = {0, 1}
 # cluster size aka nodes per ASG
 CRITICAL_TIER_MIN_CLUSTER_SIZE = 2
@@ -364,8 +386,73 @@ def _get_cluster_size_lambda(
         return next_power_of_2
 
 
+# pylint: disable=too-many-positional-arguments
+def _compute_ebs_cache_overhead(
+    cluster_count: int,
+    instance: Instance,
+    drive: Drive,
+    base_mem: float,
+    heap_fn: Callable[[float], float],
+    needed_disk_gib: float,
+    rps: float,
+    write_per_sec: float,
+    desires: CapacityDesires,
+    cache_skew_factor: float = 1.0,
+) -> Tuple[float, float]:
+    """Compute page cache CPU overhead for EBS clusters.
+
+    When the working set cannot fully fit in RAM, each cache miss goes to EBS
+    instead of RAM. The miss holds a thread ~Nx longer (where N is
+    drive_latency / avg_read_latency), consuming more CPU.
+
+    The overhead accounts for:
+    - Access skew (Zipfian): skewed workloads get better hit rates from less cache
+    - Read/write ratio: only reads incur cache miss CPU overhead
+
+    Returns (cpu_factor, coverage_pct) where:
+    - cpu_factor: multiplier >= 1.0 to apply to CPU cores
+    - coverage_pct: percent of data covered by page cache [0, 100]
+    """
+    if cluster_count <= 0:
+        return (1.0, 100.0)
+
+    reserve_per_node = base_mem + heap_fn(instance.ram_gib)
+    available_cache_per_node = max(0.0, instance.ram_gib - reserve_per_node)
+    data_per_node_gib = needed_disk_gib / cluster_count
+
+    if data_per_node_gib <= 0:
+        return (1.0, 100.0)
+
+    cache_fraction = available_cache_per_node / data_per_node_gib
+    coverage_pct = round(min(1.0, cache_fraction) * 100.0, 1)
+
+    # Compute hit rate accounting for access skew
+    hit_rate = _cache_hit_rate(cache_fraction, cache_skew_factor)
+    miss_rate = 1.0 - hit_rate
+
+    # CPU overhead: only reads incur cache miss penalty (writes go to
+    # memtable/commitlog, not through page cache reads)
+    total_ops = rps + write_per_sec
+    read_fraction = rps / total_ops if total_ops > 0 else 0.0
+
+    ws_drive = instance.drive or drive
+    drive_read_latency_ms = ws_drive.read_io_latency_ms.high  # ~P95
+    avg_read_latency_ms = desires.query_pattern.estimated_mean_read_latency_ms.mid
+
+    if avg_read_latency_ms > 0:
+        latency_ratio = drive_read_latency_ms / avg_read_latency_ms
+    else:
+        latency_ratio = 1.0
+
+    cpu_overhead = miss_rate * read_fraction * latency_ratio
+    cpu_factor = 1.0 + cpu_overhead
+
+    return (cpu_factor, coverage_pct)
+
+
 # pylint: disable=too-many-locals
 # pylint: disable=too-many-return-statements
+# pylint: disable=too-many-branches
 # flake8: noqa: C901
 def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-arguments
     instance: Instance,
@@ -383,6 +470,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     max_regional_size: int = 192,
     max_write_buffer_percent: float = 0.25,
     max_table_buffer_percent: float = 0.11,
+    cache_skew_factor: float = 1.0,
 ) -> Optional[CapacityPlan]:
     # Netflix Cassandra doesn't like to deploy on really small instances
     if instance.cpu < 2 or instance.ram_gib <= 16:
@@ -421,7 +509,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     # working set to keep more or less data in RAM. Faster drives need
     # less fronting RAM.
     ws_drive = instance.drive or drive
-    working_set = working_set_from_drive_and_slo(
+    base_working_set = working_set_from_drive_and_slo(
         drive_read_latency_dist=dist_for_interval(ws_drive.read_io_latency_ms),
         read_slo_latency_dist=dist_for_interval(
             desires.query_pattern.read_latency_slo_ms
@@ -431,6 +519,15 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         # to increase this even more.
         target_percentile=0.95,
     ).mid
+
+    # Apply cache skew factor to model non-uniform access patterns.
+    # Under Zipfian skew, a smaller fraction of data in cache serves a larger
+    # fraction of reads: adjusted_ws = base_ws^skew_factor
+    # At skew=1.0: no change. At skew=2.0: 30.6% → 9.4%.
+    if cache_skew_factor > 1.0 and base_working_set > 0:
+        working_set = base_working_set**cache_skew_factor
+    else:
+        working_set = base_working_set
 
     requirement = _estimate_cassandra_requirement(
         instance=instance,
@@ -476,12 +573,24 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         buffer_percent=(max_write_buffer_percent * max_table_buffer_percent),
     )
 
+    # For EBS (attached disk) instances, treat working set (page cache)
+    # memory as a soft constraint. Instead of hard-rejecting when the
+    # instance can't hold the full working set in RAM, we pass 0 memory
+    # to compute_stateful_zone and compute the CPU overhead from cache
+    # misses afterward. This ensures large EBS clusters always get a plan.
+    # For local disk instances: keep the original hard memory requirement.
+    is_ebs = instance.drive is None
+    if is_ebs:
+        sizing_memory_gib = 0
+    else:
+        sizing_memory_gib = int(requirement.mem_gib.mid)
+
     cluster = compute_stateful_zone(
         instance=instance,
         drive=drive,
         needed_cores=int(requirement.cpu_cores.mid),
         needed_disk_gib=needed_disk_gib,
-        needed_memory_gib=int(requirement.mem_gib.mid),
+        needed_memory_gib=sizing_memory_gib,
         needed_network_mbps=requirement.network_mbps.mid,
         # Take into account the reads per read
         # from the per node dataset using leveled compaction
@@ -502,6 +611,26 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         required_write_buffer_gib=float(requirement.context["write_buffer_gib"]),
     )
 
+    # For EBS instances, compute the page cache CPU overhead.
+    # When the working set can't fully fit in RAM, cache misses go to EBS
+    # and each miss holds a Cassandra read thread longer, consuming more CPU.
+    if is_ebs:
+        page_cache_cpu_factor, page_cache_coverage_pct = _compute_ebs_cache_overhead(
+            cluster_count=cluster.count,
+            instance=instance,
+            drive=drive,
+            base_mem=base_mem,
+            heap_fn=heap_fn,
+            needed_disk_gib=needed_disk_gib,
+            rps=rps,
+            write_per_sec=write_per_sec,
+            desires=desires,
+            cache_skew_factor=cache_skew_factor,
+        )
+    else:
+        page_cache_cpu_factor = 1.0
+        page_cache_coverage_pct = 100.0
+
     # Communicate to the actual provision that if we want reduced RF
     params = {
         "cassandra.keyspace.rf": copies_per_region,
@@ -512,7 +641,13 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         "cassandra.heap.table.percent": max_table_buffer_percent,
         "cassandra.compaction.min_threshold": requirement.context["min_threshold"],
         EFFECTIVE_DISK_PER_NODE_GIB: disk_per_node_gib,
+        "cassandra.page_cache.coverage_pct": page_cache_coverage_pct,
+        "cassandra.page_cache.cpu_factor": round(page_cache_cpu_factor, 3),
+        "cassandra.working_set.base_pct": round(base_working_set * 100, 1),
+        "cassandra.working_set.effective_pct": round(working_set * 100, 1),
     }
+    if cache_skew_factor != 1.0:
+        params["cassandra.cache_skew_factor"] = cache_skew_factor
     upsert_params(cluster, params)
 
     # Sometimes we don't want modify cluster topology, so only allow
@@ -674,6 +809,15 @@ class NflxCassandraArguments(BaseModel):
         "Note that if there are more than 100k writes this will "
         "automatically adjust to 0.2",
     )
+    cache_skew_factor: float = Field(
+        default=1.0,
+        description="Access skew factor for page cache hit rate estimation. "
+        "1.0 = uniform random access (conservative default). "
+        "2.0 = moderate Zipfian skew (e.g. typical KV store). "
+        "3.0 = high Zipfian skew (e.g. hot-key-heavy workload). "
+        "Higher values mean a smaller cache covers more reads, "
+        "reducing both memory requirements and CPU overhead from cache misses.",
+    )
 
     @classmethod
     def from_extra_model_arguments(
@@ -834,6 +978,7 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             max_local_data_per_node_gib=args.max_local_data_per_node_gib,
             max_write_buffer_percent=max_write_buffer_percent,
             max_table_buffer_percent=max_table_buffer_percent,
+            cache_skew_factor=args.cache_skew_factor,
         )
 
     @staticmethod
