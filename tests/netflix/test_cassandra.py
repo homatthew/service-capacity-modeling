@@ -1028,3 +1028,140 @@ class TestCassandraPageCacheSoftMemory:
         # behavior), so coverage should be 100% and cpu_factor 1.0
         assert result.cluster_params["cassandra.page_cache.coverage_pct"] == 100.0
         assert result.cluster_params["cassandra.page_cache.cpu_factor"] == 1.0
+
+
+class TestCacheSkewFactor:
+    """Test cache_skew_factor parameter for access skew modeling."""
+
+    def test_default_skew_preserves_behavior(self):
+        """Default cache_skew_factor=1.0 produces identical results to no skew."""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(60_000),
+                estimated_write_per_second=certain_int(10_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(10_000),
+            ),
+        )
+
+        # Plan with default skew (1.0) — should be identical to no skew arg
+        plan_default = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+                "experimental_memory_model": True,
+            },
+        )[0]
+
+        plan_explicit = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+                "cache_skew_factor": 1.0,
+                "experimental_memory_model": True,
+            },
+        )[0]
+
+        default_result = plan_default.candidate_clusters.zonal[0]
+        explicit_result = plan_explicit.candidate_clusters.zonal[0]
+
+        assert default_result.count == explicit_result.count
+        assert default_result.instance.name == explicit_result.instance.name
+
+    def test_skew_reduces_working_set(self):
+        """skew=2.0 reduces the theoretical working set, leading to cheaper
+        plans on local-disk instances where memory is a hard constraint.
+
+        On EBS with experimental_memory_model, memory is soft (essential=0),
+        so skew doesn't affect cluster shape. Use local disks to verify the
+        cost reduction from reduced working set.
+        """
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(60_000),
+                estimated_write_per_second=certain_int(10_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(4_000),
+            ),
+        )
+
+        plan_uniform = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={
+                "require_local_disks": True,
+                "cache_skew_factor": 1.0,
+                "experimental_memory_model": True,
+            },
+        )[0]
+
+        plan_skewed = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={
+                "require_local_disks": True,
+                "cache_skew_factor": 2.0,
+                "experimental_memory_model": True,
+            },
+        )[0]
+
+        skewed_result = plan_skewed.candidate_clusters.zonal[0]
+        uniform_result = plan_uniform.candidate_clusters.zonal[0]
+
+        # With skew on local disks, memory requirement shrinks → cheaper plan
+        uniform_cost = plan_uniform.candidate_clusters.total_annual_cost
+        skewed_cost = plan_skewed.candidate_clusters.total_annual_cost
+        assert skewed_cost <= uniform_cost, (
+            f"Skewed plan (${skewed_cost:.0f}) should be <= "
+            f"uniform plan (${uniform_cost:.0f})"
+        )
+
+        # The skew factor should be stored in cluster params
+        assert skewed_result.cluster_params["cassandra.cache_skew_factor"] == 2.0
+        assert uniform_result.cluster_params["cassandra.cache_skew_factor"] == 1.0
+
+    def test_skew_enables_smaller_ebs_cluster(self):
+        """skew=2.0 enables a 10 TiB EBS cluster to fit at 16 nodes."""
+        desires = CapacityDesires(
+            service_tier=1,
+            query_pattern=QueryPattern(
+                estimated_read_per_second=certain_int(60_000),
+                estimated_write_per_second=certain_int(10_000),
+            ),
+            data_shape=DataShape(
+                estimated_state_size_gib=certain_int(10_000),
+            ),
+        )
+
+        # With skew=2.0, should be able to fit in 16 nodes per zone
+        plan_skewed = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=desires,
+            extra_model_arguments={
+                "require_attached_disks": True,
+                "require_local_disks": False,
+                "cache_skew_factor": 2.0,
+                "required_cluster_size": 16,
+                "experimental_memory_model": True,
+            },
+        )
+
+        # The skewed plan should produce a result with exactly 16 nodes
+        assert len(plan_skewed) > 0, (
+            "With cache_skew_factor=2.0, a 10 TiB cluster should fit at 16 nodes"
+        )
+        result = plan_skewed[0].candidate_clusters.zonal[0]
+        assert result.count == 16

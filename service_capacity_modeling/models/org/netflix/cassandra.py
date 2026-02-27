@@ -565,6 +565,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     large_instance_regret: float = 0.2,
     different_family_regret: float = 0.10,
     experimental_memory_model: bool = False,
+    cache_skew_factor: float = 1.0,
 ) -> Optional[CapacityPlan]:
     # Netflix Cassandra doesn't like to deploy on really small instances
     if instance.cpu < 2 or instance.ram_gib <= 16:
@@ -613,6 +614,16 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         # to increase this even more.
         target_percentile=0.95,
     ).mid
+
+    # Adjust working set for access skew (theoretical path only).
+    # This does NOT apply to the observed working set from memory_utilization_gib
+    # (PR #233) because observed data already reflects real access patterns.
+    # Under uniform access (skew=1.0), working_set fraction of data must be cached.
+    # Under Zipfian skew, a smaller cache covers more reads:
+    #   adjusted = working_set ^ skew_factor
+    # e.g. working_set=0.306, skew=2.0 -> adjusted=0.094 (9.4% of data covers same reads)
+    if experimental_memory_model and cache_skew_factor > 1.0 and working_set > 0:
+        working_set = working_set**cache_skew_factor
 
     requirement = _estimate_cassandra_requirement(
         instance=instance,
@@ -724,6 +735,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         "cassandra.heap.write.percent": max_write_buffer_percent,
         "cassandra.heap.table.percent": max_table_buffer_percent,
         "cassandra.compaction.min_threshold": requirement.context["min_threshold"],
+        "cassandra.cache_skew_factor": cache_skew_factor,
         EFFECTIVE_DISK_PER_NODE_GIB: disk_per_node_gib,
         "cassandra.page_cache.coverage_pct": page_cache_coverage_pct,
         "cassandra.page_cache.cpu_factor": round(page_cache_cpu_factor, 3),
@@ -937,6 +949,14 @@ class NflxCassandraArguments(BaseModel):
         "(3) applies cache_skew_factor for non-uniform access patterns. "
         "When False (default), uses the legacy memory sizing approach.",
     )
+    cache_skew_factor: float = Field(
+        default=1.0,
+        ge=1.0,
+        description="Access skew factor for page cache hit rate estimation. "
+        "1.0 = uniform random access (conservative default). "
+        "2.0 = moderate Zipfian. 3.0 = high Zipfian. "
+        "Higher values mean a smaller cache covers more reads.",
+    )
 
     @classmethod
     def from_extra_model_arguments(
@@ -1100,6 +1120,7 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             large_instance_regret=args.large_instance_regret,
             different_family_regret=args.different_family_regret,
             experimental_memory_model=args.experimental_memory_model,
+            cache_skew_factor=args.cache_skew_factor,
         )
 
     @staticmethod
