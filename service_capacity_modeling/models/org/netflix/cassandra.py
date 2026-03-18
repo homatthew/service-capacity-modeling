@@ -948,12 +948,6 @@ class NflxCassandraArguments(BaseModel):
         "Default 14.0 (derived from LCS production clusters). Lower for TWCS or "
         "aggressive TTL workloads where SSTables expire before retention matters.",
     )
-    adaptive_storage_buffer: bool = Field(
-        default=True,
-        description="Use a data-size-adaptive storage buffer instead of the fixed 4x. "
-        "Large clusters get a lower ratio (down to min_storage_buffer_ratio) "
-        "because they already have enormous absolute headroom in GiB.",
-    )
     max_storage_buffer_ratio: float = Field(
         default=4.0,
         description="Storage buffer ratio for tiny clusters (adaptive upper bound).",
@@ -1284,13 +1278,11 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
 
         # Compute adaptive storage buffer ratio based on data size
         args = NflxCassandraArguments.from_extra_model_arguments(extra_model_arguments)
-        storage_ratio = args.max_storage_buffer_ratio
-        if args.adaptive_storage_buffer:
-            storage_ratio = _adaptive_storage_buffer_ratio(
-                _estimate_zonal_data_gib(user_desires, rf),
-                max_ratio=args.max_storage_buffer_ratio,
-                min_ratio=args.min_storage_buffer_ratio,
-            )
+        storage_ratio = _adaptive_storage_buffer_ratio(
+            _estimate_zonal_data_gib(user_desires, rf),
+            max_ratio=args.max_storage_buffer_ratio,
+            min_ratio=args.min_storage_buffer_ratio,
+        )
 
         # Compute adaptive compute buffer ratio based on total RPS
         compute_ratio = args.max_compute_buffer_ratio

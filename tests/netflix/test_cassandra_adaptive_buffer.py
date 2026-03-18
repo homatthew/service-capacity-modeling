@@ -157,58 +157,28 @@ class TestLargeClusterGetsSmallInstances:
         )
 
 
-class TestOptOut:
-    """adaptive_storage_buffer=False restores fixed 4x behavior."""
+class TestSmallClusterNearMaxBuffer:
+    """Small clusters should get near the max storage buffer ratio."""
 
-    def test_fixed_buffer_when_disabled(self):
-        """Disabling adaptive buffer should use fixed max_storage_buffer_ratio."""
-        names_adaptive = _plan_instance_names(
-            LARGE_CLUSTER_DESIRES,
+    def test_small_cluster_gets_near_max_buffer(self):
+        """400 GiB cluster should have storage_buffer_ratio near 4.0."""
+        plans = planner.plan_certain(
+            model_name="org.netflix.cassandra",
+            region="us-east-1",
+            desires=SMALL_CLUSTER_DESIRES,
             extra_model_arguments={},
-            families=["m6id"],
+            num_results=5,
+            max_results_per_family=5,
+            instance_families=["m6id"],
         )
-        names_fixed = _plan_instance_names(
-            LARGE_CLUSTER_DESIRES,
-            extra_model_arguments={"adaptive_storage_buffer": False},
-            families=["m6id"],
+        assert plans, "Expected at least one plan"
+        ratio = (
+            plans[0]
+            .candidate_clusters.zonal[0]
+            .cluster_params.get("cassandra.storage_buffer_ratio")
         )
-        # Fixed 4x buffer should accept same or fewer instance types
-        assert len(names_fixed) <= len(names_adaptive), (
-            f"Fixed buffer should accept same or fewer instance types. "
-            f"Adaptive: {names_adaptive}, Fixed: {names_fixed}"
-        )
-        # Verify the buffer actually changed — adaptive should rank cheaper
-        # instances higher (8xlarge before 16xlarge)
-        if any("8xlarge" in n for n in names_adaptive) and any(
-            "16xlarge" in n for n in names_adaptive
-        ):
-            idx_8_a = next(i for i, n in enumerate(names_adaptive) if "8xlarge" in n)
-            idx_16_a = next(i for i, n in enumerate(names_adaptive) if "16xlarge" in n)
-            assert idx_8_a < idx_16_a, (
-                f"Adaptive should rank 8xlarge above 16xlarge, got: {names_adaptive}"
-            )
-
-
-class TestSmallClusterUnchanged:
-    """Small clusters should see negligible buffer change."""
-
-    def test_small_cluster_gets_similar_results(self):
-        """400 GiB cluster should get similar plans with or without adaptive."""
-        names_adaptive = _plan_instance_names(
-            SMALL_CLUSTER_DESIRES,
-            extra_model_arguments={},
-            families=["m6id"],
-        )
-        names_fixed = _plan_instance_names(
-            SMALL_CLUSTER_DESIRES,
-            extra_model_arguments={"adaptive_storage_buffer": False},
-            families=["m6id"],
-        )
-        # Same instance types should be available for small clusters
-        assert set(names_adaptive) == set(names_fixed), (
-            f"Small cluster instance options should be the same. "
-            f"Adaptive: {names_adaptive}, Fixed: {names_fixed}"
-        )
+        assert ratio is not None
+        assert ratio > 3.8, f"Small cluster should have near-max buffer, got {ratio}"
 
 
 class TestAdaptiveComputeBufferFormula:
