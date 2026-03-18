@@ -957,12 +957,6 @@ class NflxCassandraArguments(BaseModel):
         description="Storage buffer ratio for very large clusters (adaptive lower bound).",
     )
 
-    adaptive_compute_buffer: bool = Field(
-        default=True,
-        description="Use a traffic-adaptive compute buffer instead of fixed 1.5x. "
-        "Large clusters get a lower ratio (down to min_compute_buffer_ratio) "
-        "because sqrt staffing provides natural headroom at scale.",
-    )
     max_compute_buffer_ratio: float = Field(
         default=1.5,
         description="Compute success buffer for tiny clusters (adaptive upper bound).",
@@ -1284,24 +1278,21 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             min_ratio=args.min_storage_buffer_ratio,
         )
 
-        # Compute adaptive compute buffer ratio based on total RPS
-        compute_ratio = args.max_compute_buffer_ratio
-        if args.adaptive_compute_buffer:
-            # Write-weighted throughput as a proxy for CPU load. Writes are
-            # ~3x more expensive per byte than reads (memtable flushes and
-            # compaction pressure scale with write size, not just write count).
-            qp = user_desires.query_pattern
-            write_weighted_throughput_mbps = (
-                qp.estimated_read_per_second.mid * qp.estimated_mean_read_size_bytes.mid
-                + 3.0
-                * qp.estimated_write_per_second.mid
-                * qp.estimated_mean_write_size_bytes.mid
-            ) / (1024 * 1024)
-            compute_ratio = _adaptive_compute_buffer_ratio(
-                write_weighted_throughput_mbps,
-                max_ratio=args.max_compute_buffer_ratio,
-                min_ratio=args.min_compute_buffer_ratio,
-            )
+        # Compute adaptive compute buffer ratio based on write-weighted throughput.
+        # Writes are ~3x more expensive per byte than reads (memtable flushes and
+        # compaction pressure scale with write size, not just write count).
+        qp = user_desires.query_pattern
+        write_weighted_throughput_mbps = (
+            qp.estimated_read_per_second.mid * qp.estimated_mean_read_size_bytes.mid
+            + 3.0
+            * qp.estimated_write_per_second.mid
+            * qp.estimated_mean_write_size_bytes.mid
+        ) / (1024 * 1024)
+        compute_ratio = _adaptive_compute_buffer_ratio(
+            write_weighted_throughput_mbps,
+            max_ratio=args.max_compute_buffer_ratio,
+            min_ratio=args.min_compute_buffer_ratio,
+        )
 
         # By supplying these buffers we can deconstruct observed utilization into
         # load versus buffer.

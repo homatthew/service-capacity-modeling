@@ -266,12 +266,15 @@ class TestAdaptiveComputeBufferIntegration:
             f"Expected compute_buffer_ratio < 1.5 for 400k RPS cluster, got {ratio}"
         )
 
-    def test_compute_buffer_opt_out(self):
-        """adaptive_compute_buffer=False should produce fixed 1.5x ratio."""
+    def test_max_ratio_respected(self):
+        """Setting max_compute_buffer_ratio clamps the upper bound."""
         ratio = _get_compute_buffer_ratio(
-            LARGE_CLUSTER_DESIRES,
-            extra_model_arguments={"adaptive_compute_buffer": False},
+            SMALL_CLUSTER_DESIRES,
+            extra_model_arguments={
+                "max_compute_buffer_ratio": 1.4,
+                "min_compute_buffer_ratio": 1.1,
+            },
         )
-        assert ratio == 1.5, (
-            f"Expected compute_buffer_ratio == 1.5 when adaptive disabled, got {ratio}"
+        assert ratio <= 1.4, (
+            f"Expected compute_buffer_ratio <= 1.4 with max override, got {ratio}"
         )
