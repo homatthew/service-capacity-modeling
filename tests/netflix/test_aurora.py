@@ -6,6 +6,8 @@ from service_capacity_modeling.capacity_planner import planner
 from service_capacity_modeling.interface import CapacityDesires
 from service_capacity_modeling.interface import certain_float
 from service_capacity_modeling.interface import certain_int
+from service_capacity_modeling.interface import CurrentClusters
+from service_capacity_modeling.interface import CurrentRegionClusterCapacity
 from service_capacity_modeling.interface import DataShape
 from service_capacity_modeling.interface import Interval
 from service_capacity_modeling.interface import QueryPattern
@@ -91,6 +93,91 @@ tier_3 = CapacityDesires(
         estimated_state_size_gib=certain_int(200),
     ),
 )
+
+
+def _low_rps_current_aurora_desires(regional):
+    return CapacityDesires(
+        service_tier=1,
+        query_pattern=QueryPattern(
+            estimated_read_per_second=certain_int(10),
+            estimated_write_per_second=certain_int(10),
+            estimated_mean_read_latency_ms=certain_float(5.0),
+            estimated_mean_write_latency_ms=certain_float(8.0),
+        ),
+        data_shape=DataShape(estimated_state_size_gib=certain_int(20)),
+        current_clusters=CurrentClusters(regional=regional),
+    )
+
+
+def _current_aurora_writer(instance_count=1, cluster_type=None):
+    return CurrentRegionClusterCapacity(
+        cluster_instance_name="db.r6g.4xlarge",
+        cluster_instance_count=certain_int(instance_count),
+        cpu_utilization=certain_float(88.0),
+        cluster_type=cluster_type,
+    )
+
+
+def _plan_low_rps_current_aurora(regional):
+    return planner.plan_certain(
+        model_name="org.netflix.aurora",
+        region="us-east-1",
+        desires=_low_rps_current_aurora_desires(regional),
+    )
+
+
+def test_observed_cpu_utilization_raises_requirement_over_low_rps():
+    """Number of cores due to low RPS would have been small but higher
+    CPU% on the current writer still forces a large type."""
+    cap_plan = _plan_low_rps_current_aurora([_current_aurora_writer()])
+    assert len(cap_plan) >= 1
+    resp = cap_plan[0].candidate_clusters.regional[0].instance
+    assert cap_plan[0].requirements.regional[0].cpu_cores.mid >= 24
+    assert resp.cpu >= 32
+
+
+def test_observed_cpu_ignores_non_aurora_regional_clusters():
+    aurora_only = _plan_low_rps_current_aurora(
+        [_current_aurora_writer(cluster_type="aurora-cluster")]
+    )
+    mixed_regional = _plan_low_rps_current_aurora(
+        [
+            CurrentRegionClusterCapacity(
+                cluster_instance_name="m5.12xlarge",
+                cluster_instance_count=certain_int(5),
+                cpu_utilization=certain_float(99.0),
+                cluster_type="stateless-java",
+            ),
+            _current_aurora_writer(cluster_type="aurora-cluster"),
+        ]
+    )
+
+    assert (
+        mixed_regional[0].candidate_clusters.regional[0].instance.name
+        == aurora_only[0].candidate_clusters.regional[0].instance.name
+    )
+    assert (
+        mixed_regional[0].requirements.regional[0].cpu_cores.mid
+        == aurora_only[0].requirements.regional[0].cpu_cores.mid
+    )
+
+
+def test_observed_cpu_uses_writer_instance_not_regional_count():
+    single_writer = _plan_low_rps_current_aurora(
+        [_current_aurora_writer(instance_count=1, cluster_type="aurora-cluster")]
+    )
+    writer_plus_reader = _plan_low_rps_current_aurora(
+        [_current_aurora_writer(instance_count=2, cluster_type="aurora-cluster")]
+    )
+
+    assert (
+        writer_plus_reader[0].requirements.regional[0].cpu_cores.mid
+        == single_writer[0].requirements.regional[0].cpu_cores.mid
+    )
+    assert (
+        writer_plus_reader[0].candidate_clusters.regional[0].instance.name
+        == single_writer[0].candidate_clusters.regional[0].instance.name
+    )
 
 
 def test_tier_0_not_supported():

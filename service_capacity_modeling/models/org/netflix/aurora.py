@@ -18,6 +18,7 @@ from service_capacity_modeling.interface import certain_float
 from service_capacity_modeling.interface import certain_int
 from service_capacity_modeling.interface import Clusters
 from service_capacity_modeling.interface import Consistency
+from service_capacity_modeling.interface import CurrentRegionClusterCapacity
 from service_capacity_modeling.interface import DataShape
 from service_capacity_modeling.interface import Drive
 from service_capacity_modeling.interface import FixedInterval
@@ -31,10 +32,55 @@ from service_capacity_modeling.interface import RegionContext
 from service_capacity_modeling.interface import Requirements
 from service_capacity_modeling.models import CapacityModel
 from service_capacity_modeling.models.common import normalize_cores
+from service_capacity_modeling.models.common import RequirementFromCurrentCapacity
 from service_capacity_modeling.models.common import simple_network_mbps
 from service_capacity_modeling.models.common import sqrt_staffed_cores
 
 logger = logging.getLogger(__name__)
+
+AURORA_CLUSTER_TYPE = "aurora-cluster"
+
+
+def _current_aurora_clusters(
+    desires: CapacityDesires,
+) -> Tuple[CurrentRegionClusterCapacity, ...]:
+    cc = desires.current_clusters
+    if not cc:
+        return ()
+
+    return tuple(
+        current
+        for current in cc.regional
+        if current.cluster_type in (None, AURORA_CLUSTER_TYPE)
+    )
+
+
+def _existing_writer_cpu_floor_cores(
+    instance: Instance, desires: CapacityDesires
+) -> int:
+    """Minimum cores required on candidate instance from the existing
+    cluster in `desires` (`current_clusters.regional`)."""
+    best = 0
+    for current in _current_aurora_clusters(desires):
+        if current.cpu_utilization.mid < 1.0:
+            continue
+
+        # Aurora's writer CPU must fit on one instance. A regional Aurora cluster
+        # can include readers, so do not multiply writer CPU by total cluster count.
+        writer_current = current.model_copy(
+            update={"cluster_instance_count": certain_int(1)}
+        )
+        requirement = RequirementFromCurrentCapacity(
+            current_capacity=writer_current,
+            buffers=desires.buffers,
+        )
+        need_on_candidate = normalize_cores(
+            core_count=requirement.cpu(instance_candidate=instance),
+            target_shape=instance,
+            reference_shape=requirement.current_instance,
+        )
+        best = max(best, need_on_candidate)
+    return best
 
 
 def _estimate_aurora_requirement(
@@ -59,7 +105,14 @@ def _estimate_aurora_requirement(
         reference_shape=desires.reference_shape,
     )
 
-    # 20% head room For replication, backups etc.
+    # When `current_clusters` includes an existing writer, account for it as well
+    # as query-pattern staffing. The latter alone may yield fewer cores than the
+    # writer already needs.
+    needed_cores = max(
+        needed_cores, _existing_writer_cpu_floor_cores(instance, desires)
+    )
+
+    # 20% head room for replication, backups etc.
     needed_network_mbps = simple_network_mbps(desires) * 1.2
     needed_disk = round(desires.data_shape.estimated_state_size_gib.mid, 2)
 
@@ -202,7 +255,7 @@ def _compute_aurora_region(  # pylint: disable=too-many-positional-arguments
     instance_count = 2 if desires.service_tier <= 1 else 1
 
     return RegionClusterCapacity(
-        cluster_type="aurora-cluster",
+        cluster_type=AURORA_CLUSTER_TYPE,
         count=instance_count,
         instance=instance,
         attached_drives=attached_drives,
