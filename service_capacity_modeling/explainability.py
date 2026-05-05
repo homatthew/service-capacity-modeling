@@ -312,7 +312,13 @@ STATELESS_SERVICE_FAMILIES: FrozenSet[str] = frozenset(
 
 
 def deduplicate_excuses(excuses: Sequence[Excuse]) -> Sequence[Excuse]:
-    """Deduplicate excuses by (instance, drive, reason) across simulations."""
+    """Deduplicate excuses by (instance, drive, reason, bottleneck, tags).
+
+    The dedup key includes bottleneck and tags so excuses with the same
+    instance/drive/reason but different bottleneck or tag sets are preserved
+    as separate entries. When duplicate excuses have conflicting context
+    dicts, the context is cleared.
+    """
     seen: Set[Tuple[str, str, str, Optional[Bottleneck], Tuple[str, ...]]] = set()
     result_by_key: Dict[
         Tuple[str, str, str, Optional[Bottleneck], Tuple[str, ...]], Excuse

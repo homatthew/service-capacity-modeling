@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import math
+import warnings
 from hashlib import blake2b
 from typing import Any
 from typing import Callable
@@ -565,6 +566,15 @@ def _merge_regret_candidates(
     zonal_requirements: Dict[str, Dict[str, List[Interval]]],
     regional_requirements: Dict[str, Dict[str, List[Interval]]],
 ) -> List[_MergedRegretCandidate]:
+    empty_models = [
+        name for name, details in regret_details_by_model.items() if not details
+    ]
+    if empty_models:
+        logger.warning(
+            "Sub-models produced no plans in any world: %s. "
+            "Merged results will omit their contribution.",
+            ", ".join(empty_models),
+        )
     model_names = [
         model_name
         for model_name, regret_details in regret_details_by_model.items()
@@ -638,12 +648,7 @@ def _summarize_regret_candidates(
                 "min_total_regret": candidate.total_regret,
                 "max_total_regret": candidate.total_regret,
                 "example_worlds": [],
-                "regret_components_by_model_samples": {
-                    model_name: [components]
-                    for model_name, components in (
-                        candidate.regret_components_by_model.items()
-                    )
-                },
+                "regret_components_by_model_samples": {},
             }
             ordered_signatures.append(signature)
 
@@ -1393,9 +1398,18 @@ class CapacityPlanner:
         drives: Optional[Sequence[str]] = None,
         regret_params: Optional[CapacityRegretParameters] = None,
         extra_model_arguments: Optional[Dict[str, Any]] = None,
+        explain: bool = True,
         max_results_per_family: int = 1,
         planner_arguments: Optional[PlannerArguments] = None,
     ) -> UncertainCapacityPlan:
+        if explain is not True:
+            warnings.warn(
+                "The 'explain' parameter is deprecated and ignored. "
+                "Excuses are always collected. Use plan_explained() for "
+                "the full explained surface.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return self.plan_explained(
             model_name=model_name,
             region=region,
