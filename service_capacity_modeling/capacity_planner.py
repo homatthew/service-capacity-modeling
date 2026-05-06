@@ -1666,7 +1666,9 @@ class CapacityPlanner:
         world_order = [world.world_id for world in base_worlds]
 
         for sub_model, sub_desires in base_desires_by_model.items():
-            for index, sim_desires in enumerate(model_desires(sub_desires, simulations)):
+            for index, sim_desires in enumerate(
+                model_desires(sub_desires, simulations)
+            ):
                 world = base_worlds[index]
                 sim_result = self._plan_certain(
                     model_name=sub_model,
