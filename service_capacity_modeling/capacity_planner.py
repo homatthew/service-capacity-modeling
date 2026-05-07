@@ -2,7 +2,6 @@
 # pylint: disable=too-many-lines
 import functools
 import json
-import logging
 import math
 import warnings
 from hashlib import blake2b
@@ -64,8 +63,6 @@ from service_capacity_modeling.models.utils import current_instance_name
 from service_capacity_modeling.models.utils import reduce_by_family
 from service_capacity_modeling.stats import dist_for_interval
 from service_capacity_modeling.stats import interval_percentile
-
-logger = logging.getLogger(__name__)
 
 
 class PlannerArguments(ExcludeUnsetModel):
@@ -522,109 +519,91 @@ def _mean_component_maps(
 
 
 def _plan_signature(plan: CapacityPlan) -> str:
-    return json.dumps(plan.candidate_clusters.model_dump(mode="json"), sort_keys=True)
+    """Topology-only signature for grouping plans by hardware shape.
+
+    Excludes costs and rank so the same cluster topology across different
+    sampled worlds produces the same signature.
+    """
+    topo = plan.candidate_clusters
+
+    def _cluster_key(c: ClusterCapacity) -> Dict[str, Any]:
+        return {
+            "cluster_type": c.cluster_type,
+            "count": c.count,
+            "instance": c.instance.name,
+            "family": c.instance.family,
+            "drives": [
+                {"name": d.name, "size_gib": d.size_gib}
+                for d in (c.attached_drives or [])
+            ],
+        }
+
+    sig: Dict[str, Any] = {
+        "zonal": [_cluster_key(c) for c in (topo.zonal or [])],
+        "regional": [_cluster_key(c) for c in (topo.regional or [])],
+        "services": [{"service_type": s.service_type} for s in (topo.services or [])],
+    }
+    return json.dumps(sig, sort_keys=True)
 
 
-def _reduce_regret_by_family(
-    candidates: Sequence[_MergedRegretCandidate],
-    max_results_per_family: int,
-) -> List[_MergedRegretCandidate]:
-    zonal_families: Dict[Tuple[Tuple[str, str], ...], int] = {}
-    regional_families: Dict[Tuple[Tuple[str, str], ...], int] = {}
-    result: List[_MergedRegretCandidate] = []
-
-    for candidate in candidates:
-        topo = candidate.plan.candidate_clusters
-        regional_type: Tuple[Tuple[str, str], ...] = tuple()
-        zonal_type: Tuple[Tuple[str, str], ...] = tuple()
-
-        if topo.regional:
-            regional_type = tuple(
-                sorted({(c.cluster_type, c.instance.family) for c in topo.regional})
-            )
-        if topo.zonal:
-            zonal_type = tuple(
-                sorted({(c.cluster_type, c.instance.family) for c in topo.zonal})
-            )
-
-        zonal_count = zonal_families.get(zonal_type, 0)
-        regional_count = regional_families.get(regional_type, 0)
-        if (
-            zonal_count < max_results_per_family
-            or regional_count < max_results_per_family
-        ):
-            result.append(candidate)
-            zonal_families[zonal_type] = zonal_count + 1
-            regional_families[regional_type] = regional_count + 1
-
-    return result
+def _add_plan_requirements(
+    plan: CapacityPlan,
+    zonal_requirements: Dict[str, Dict[str, List[Interval]]],
+    regional_requirements: Dict[str, Dict[str, List[Interval]]],
+) -> None:
+    for req in plan.requirements.zonal:
+        _add_requirement(req, zonal_requirements)
+    for req in plan.requirements.regional:
+        _add_requirement(req, regional_requirements)
 
 
-def _merge_regret_candidates(
+def _merge_plan_components(plans: Sequence[CapacityPlan]) -> CapacityPlan:
+    if not plans:
+        raise ValueError("Cannot merge an empty plan sequence")
+
+    merged_plan = plans[0]
+    for plan in plans[1:]:
+        next_plan = merge_plan(merged_plan, plan)
+        if next_plan is None:
+            raise RuntimeError("Failed to merge composed capacity plans")
+        merged_plan = next_plan
+    return merged_plan
+
+
+def _merge_regret_candidates_positional(
     regret_details_by_model: Dict[str, Sequence[RegretCandidate]],
-    world_order: Sequence[str],
     zonal_requirements: Dict[str, Dict[str, List[Interval]]],
     regional_requirements: Dict[str, Dict[str, List[Interval]]],
 ) -> List[_MergedRegretCandidate]:
-    empty_models = [
-        name for name, details in regret_details_by_model.items() if not details
-    ]
-    if empty_models:
-        logger.warning(
-            "Sub-models produced no plans in any world: %s. "
-            "Merged results will omit their contribution.",
-            ", ".join(empty_models),
-        )
-    model_names = [
-        model_name
-        for model_name, regret_details in regret_details_by_model.items()
-        if regret_details
-    ]
+    """Positional merge of per-model regret lists — same pairing as _merge_models.
+
+    Each sub-model's regret list is sorted by total regret, so position i of
+    the Cassandra list is paired with position i of EVCache, etc.  This
+    matches the zip(*plans_by_model) merge that produces least_regret in
+    plan() and plan_explained(), so the resulting signatures are guaranteed
+    to align with the least_regret output.
+    """
+    model_names = [name for name, details in regret_details_by_model.items() if details]
     if not model_names:
         return []
 
-    details_by_model_and_world = {
-        model_name: {
-            candidate.world.world_id: candidate
-            for candidate in regret_details_by_model[model_name]
-        }
-        for model_name in model_names
-    }
-
-    merged_candidates: List[_MergedRegretCandidate] = []
-    for world_id in world_order:
-        components: List[RegretCandidate] = []
-        for model_name in model_names:
-            candidate = details_by_model_and_world[model_name].get(world_id)
-            if candidate is None:
-                components = []
-                break
-            components.append(candidate)
-        if not components:
-            continue
-
-        merged_plan = components[0].plan
-        for detail in components[1:]:
-            merged_plan = cast(CapacityPlan, merge_plan(merged_plan, detail.plan))
-        for req in merged_plan.requirements.zonal:
-            _add_requirement(req, zonal_requirements)
-        for req in merged_plan.requirements.regional:
-            _add_requirement(req, regional_requirements)
-
-        merged_candidates.append(
+    lists = [regret_details_by_model[name] for name in model_names]
+    merged: List[_MergedRegretCandidate] = []
+    for components in zip(*lists):
+        merged_plan = _merge_plan_components([detail.plan for detail in components])
+        _add_plan_requirements(merged_plan, zonal_requirements, regional_requirements)
+        merged.append(
             _MergedRegretCandidate(
                 world=components[0].world,
                 plan=merged_plan,
-                total_regret=sum(detail.total_regret for detail in components),
+                total_regret=sum(d.total_regret for d in components),
                 regret_components_by_model={
-                    model_name: dict(detail.regret_components)
-                    for model_name, detail in zip(model_names, components)
+                    name: dict(detail.regret_components)
+                    for name, detail in zip(model_names, components)
                 },
             )
         )
-
-    merged_candidates.sort(key=lambda candidate: candidate.total_regret)
-    return merged_candidates
+    return merged
 
 
 def _summarize_regret_candidates(
@@ -705,6 +684,34 @@ def _summarize_regret_candidates(
     return summaries
 
 
+def _summaries_for_least_regret(
+    least_regret: Sequence[CapacityPlan],
+    regret_summary_map: Dict[str, RegretPlanSummary],
+) -> List[RegretPlanSummary]:
+    summaries: List[RegretPlanSummary] = []
+    missing: List[Tuple[int, str]] = []
+
+    for index, plan in enumerate(least_regret):
+        signature = _plan_signature(plan)
+        summary = regret_summary_map.get(signature)
+        if summary is None:
+            missing.append((index, signature))
+            continue
+        summaries.append(summary)
+
+    if missing:
+        missing_descriptions = ", ".join(
+            f"index={index} signature={signature}" for index, signature in missing
+        )
+        raise RuntimeError(
+            "Missing regret summaries for least_regret plans. "
+            "The composed plan merge and provenance merge diverged: "
+            f"{missing_descriptions}"
+        )
+
+    return summaries
+
+
 def _add_requirement(
     requirement: CapacityRequirement, accum: Dict[str, Dict[str, List[Interval]]]
 ) -> None:
@@ -729,16 +736,9 @@ def _merge_models(
 ) -> List[CapacityPlan]:
     capacity_plans = []
     for composed in zip(*filter(lambda x: x, plans_by_model)):
-        merged_plans = [functools.reduce(merge_plan, composed)]
-        if len(merged_plans) == 0:
-            continue
-
-        capacity_plans.append(merged_plans[0])
-        plan_requirements = merged_plans[0].requirements
-        for req in plan_requirements.zonal:
-            _add_requirement(req, zonal_requirements)
-        for req in plan_requirements.regional:
-            _add_requirement(req, regional_requirements)
+        merged_plan = _merge_plan_components(composed)
+        capacity_plans.append(merged_plan)
+        _add_plan_requirements(merged_plan, zonal_requirements, regional_requirements)
     return capacity_plans
 
 
@@ -1402,7 +1402,7 @@ class CapacityPlanner:
         max_results_per_family: int = 1,
         planner_arguments: Optional[PlannerArguments] = None,
     ) -> UncertainCapacityPlan:
-        if explain is not True:
+        if explain is False:
             warnings.warn(
                 "The 'explain' parameter is deprecated and ignored. "
                 "Excuses are always collected. Use plan_explained() for "
@@ -1578,18 +1578,16 @@ class CapacityPlanner:
         num_results = num_results or self._default_num_results
         lifecycles = lifecycles or self._default_lifecycles
 
-        # requirement types -> values
         zonal_requirements: Dict[str, Dict[str, List[Interval]]] = {}
         regional_requirements: Dict[str, Dict[str, List[Interval]]] = {}
 
         (
-            _base_desires_by_model,
-            _regret_clusters_by_model,
+            base_desires_by_model,
+            regret_clusters_by_model,
             regret_details_by_model,
-            _excuses_by_model,
+            excuses_by_model,
             world_excuses_by_model,
             all_world_excuses,
-            world_order,
         ) = self._collect_uncertain_world_data(
             model_name=model_name,
             region=region,
@@ -1604,68 +1602,108 @@ class CapacityPlanner:
             planner_arguments=pargs,
         )
 
-        # Now accumulate across the composed models and return the top N
-        # by distinct hardware type
-        merged_regret_candidates = _merge_regret_candidates(
+        merged_regret_candidates = _merge_regret_candidates_positional(
             regret_details_by_model=regret_details_by_model,
-            world_order=world_order,
             zonal_requirements=zonal_requirements,
             regional_requirements=regional_requirements,
         )
-        standard_plan = self.plan(
+        least_regret = reduce_by_family(
+            [candidate.plan for candidate in merged_regret_candidates],
+            max_results_per_family=pargs.max_results_per_family,
+        )[:num_results]
+        regret_summary_map = _summarize_regret_candidates(merged_regret_candidates)
+        least_regret_summaries = _summaries_for_least_regret(
+            least_regret, regret_summary_map
+        )
+
+        low_p, high_p = sorted(percentiles)[0], sorted(percentiles)[-1]
+        final_zonal = []
+        final_regional = []
+        for req_type, samples in zonal_requirements.items():
+            req = CapacityRequirement(
+                requirement_type=req_type,
+                **{
+                    k: interval(samples=[i.mid for i in v], low_p=low_p, high_p=high_p)
+                    for k, v in samples.items()
+                },
+            )
+            final_zonal.append(req)
+        for req_type, samples in regional_requirements.items():
+            req = CapacityRequirement(
+                requirement_type=req_type,
+                **{
+                    k: interval(samples=[i.mid for i in v], low_p=low_p, high_p=high_p)
+                    for k, v in samples.items()
+                },
+            )
+            final_regional.append(req)
+
+        mean_plan, percentile_plans = self._plan_percentiles(
             model_name=model_name,
+            percentiles=percentiles,
             region=region,
             desires=desires,
-            percentiles=percentiles,
-            simulations=simulations,
-            num_results=num_results,
-            num_regions=num_regions,
-            lifecycles=lifecycles,
-            instance_families=instance_families,
-            drives=drives,
-            regret_params=regret_params,
             extra_model_arguments=extra_model_arguments,
-            max_results_per_family=max_results_per_family,
-            planner_arguments=planner_arguments,
+            num_regions=num_regions,
+            instance_families=instance_families,
         )
-        least_regret = standard_plan.least_regret
-        regret_summary_map = _summarize_regret_candidates(merged_regret_candidates)
-        least_regret_summaries = [
-            regret_summary_map[_plan_signature(plan)]
-            for plan in least_regret
-            if _plan_signature(plan) in regret_summary_map
-        ]
 
-        standard_plan.explanation.regret_details_by_model = regret_details_by_model
-        standard_plan.explanation.regret_summaries_by_model = {
-            model_name: list(
-                _summarize_regret_candidates(
-                    [
-                        _MergedRegretCandidate(
-                            world=candidate.world,
-                            plan=candidate.plan,
-                            total_regret=candidate.total_regret,
-                            regret_components_by_model={
-                                model_name: candidate.regret_components
-                            },
+        uncertain_plan = UncertainCapacityPlan(
+            requirements=Requirements(zonal=final_zonal, regional=final_regional),
+            least_regret=least_regret,
+            mean=mean_plan,
+            percentiles=percentile_plans,
+            explanation=PlanExplanation(
+                regret_params=regret_params,
+                desires_by_model={
+                    model: desires.merge_with(
+                        self._models[model].default_desires(
+                            base_desires_by_model[model], extra_model_arguments
                         )
-                        for candidate in regret_details
-                    ]
-                ).values()
-            )
-            for model_name, regret_details in regret_details_by_model.items()
-        }
-        standard_plan.explanation.excuse_counts_by_model = {
-            model: count_world_excuses(
-                [(world_excuse.world, world_excuse.excuse) for world_excuse in excuses]
-            )
-            for model, excuses in world_excuses_by_model.items()
-            if excuses
-        }
-        standard_plan.explanation.context["regret"] = least_regret
+                    )
+                    for model in regret_clusters_by_model
+                },
+                regret_clusters_by_model=regret_clusters_by_model,
+                regret_details_by_model=regret_details_by_model,
+                regret_summaries_by_model={
+                    model_name: list(
+                        _summarize_regret_candidates(
+                            [
+                                _MergedRegretCandidate(
+                                    world=candidate.world,
+                                    plan=candidate.plan,
+                                    total_regret=candidate.total_regret,
+                                    regret_components_by_model={
+                                        model_name: candidate.regret_components
+                                    },
+                                )
+                                for candidate in regret_details
+                            ]
+                        ).values()
+                    )
+                    for model_name, regret_details in regret_details_by_model.items()
+                },
+                excuses_by_model={
+                    model: deduplicate_excuses(excuses)
+                    for model, excuses in excuses_by_model.items()
+                    if excuses
+                },
+                excuse_counts_by_model={
+                    model: count_world_excuses(
+                        [
+                            (world_excuse.world, world_excuse.excuse)
+                            for world_excuse in excuses
+                        ]
+                    )
+                    for model, excuses in world_excuses_by_model.items()
+                    if excuses
+                },
+                context={"regret": least_regret},
+            ),
+        )
 
         all_excuses = [world_excuse.excuse for world_excuse in all_world_excuses]
-        excuses = deduplicate_excuses(all_excuses)
+        deduped_excuses = deduplicate_excuses(all_excuses)
         excuse_summary = count_world_excuses(
             [
                 (world_excuse.world, world_excuse.excuse)
@@ -1674,11 +1712,11 @@ class CapacityPlanner:
         )
         hardware = self._shapes.region(region)
         model = self._models[model_name]
-        graph = FamilyGraph.build(excuses, hardware, model.preferred_families())
+        graph = FamilyGraph.build(deduped_excuses, hardware, model.preferred_families())
 
         return ExplainedUncertainPlans(
-            plan=standard_plan,
-            excuses=excuses,
+            plan=uncertain_plan,
+            excuses=deduped_excuses,
             excuse_summary=excuse_summary,
             family_graph=graph,
             least_regret_summaries=least_regret_summaries,
@@ -1704,7 +1742,6 @@ class CapacityPlanner:
         Dict[str, List[Excuse]],
         Dict[str, List[_WorldExcuse]],
         List[_WorldExcuse],
-        List[str],
     ]:
         base_desires_by_model = dict(
             self._sub_models(
@@ -1727,10 +1764,10 @@ class CapacityPlanner:
         world_plans_by_model: Dict[str, List[_WorldPlan]] = {
             model: [] for model in base_desires_by_model
         }
-        # Sample fully defaulted model desires, but keep one top-level world id
-        # sequence so composed models can still merge by sampled world.
+        # World IDs are derived from the base (undefaulted) desires so composed
+        # sub-models share the same ID sequence for merge-by-world.  Labels
+        # describe the base sampling distribution, not sub-model resolved values.
         base_worlds = [world for world, _ in model_worlds(desires, simulations)]
-        world_order = [world.world_id for world in base_worlds]
 
         for sub_model, sub_desires in base_desires_by_model.items():
             for index, sim_desires in enumerate(
@@ -1784,7 +1821,6 @@ class CapacityPlanner:
             excuses_by_model,
             world_excuses_by_model,
             all_world_excuses,
-            world_order,
         )
 
     def _sub_models(

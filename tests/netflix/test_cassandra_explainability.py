@@ -182,7 +182,7 @@ class TestPlanExplained:
         assert summaries[0].example_worlds[0].world_label
 
     def test_explained_uncertain_has_least_regret_summaries(self, explained_uncertain):
-        assert len(explained_uncertain.least_regret_summaries) <= len(
+        assert len(explained_uncertain.least_regret_summaries) == len(
             explained_uncertain.plan.least_regret
         )
         assert all(
@@ -208,10 +208,6 @@ class TestPlanExplained:
         )
         assert explained_uncertain.excuse_summary[0].example_worlds
         assert explained_uncertain.plan.explanation.excuse_counts_by_model
-
-    def test_plan_wrapper_returns_uncertain_capacity_plan(self, explained_uncertain):
-        """plan() returns UncertainCapacityPlan (not the explained wrapper)."""
-        assert isinstance(explained_uncertain.plan, UncertainCapacityPlan)
 
     def test_plan_always_has_excuses(self, explained_uncertain):
         """Excuses are always populated — no explain flag needed."""

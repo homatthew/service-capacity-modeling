@@ -1,3 +1,7 @@
+import pytest
+
+from service_capacity_modeling.capacity_planner import _plan_signature
+from service_capacity_modeling.capacity_planner import _summaries_for_least_regret
 from service_capacity_modeling.capacity_planner import planner
 from service_capacity_modeling.interface import CapacityDesires
 from service_capacity_modeling.interface import DataShape
@@ -147,6 +151,16 @@ def test_composed_explained_worlds_exist_in_all_models():
         simulations=12,
     )
 
+    assert len(explained.least_regret_summaries) == len(explained.plan.least_regret), (
+        f"Every least_regret plan must have a summary. "
+        f"Got {len(explained.least_regret_summaries)} summaries "
+        f"for {len(explained.plan.least_regret)} plans."
+    )
+    for plan, summary in zip(
+        explained.plan.least_regret, explained.least_regret_summaries
+    ):
+        assert _plan_signature(summary.plan) == _plan_signature(plan)
+
     world_ids_by_model = {
         model_name: {detail.world.world_id for detail in details}
         for model_name, details in (
@@ -154,8 +168,11 @@ def test_composed_explained_worlds_exist_in_all_models():
         )
     }
     assert world_ids_by_model
+    expected_model_names = set(world_ids_by_model)
 
     for summary in explained.least_regret_summaries:
+        assert set(summary.selected_regret_components_by_model) == expected_model_names
+        assert set(summary.mean_regret_components_by_model) == expected_model_names
         for example_world in summary.example_worlds:
             assert all(
                 example_world.world_id in world_ids
@@ -183,3 +200,16 @@ def test_plan_explained_preserves_plan_output():
     assert explained.plan.requirements == plain.requirements
     assert explained.plan.mean == plain.mean
     assert explained.plan.percentiles == plain.percentiles
+
+
+def test_least_regret_summary_lookup_rejects_missing_plan():
+    plain = planner.plan(
+        model_name="org.netflix.cassandra",
+        region="us-east-1",
+        desires=uncertain_mid,
+        num_results=1,
+        simulations=2,
+    )
+
+    with pytest.raises(RuntimeError, match="Missing regret summaries"):
+        _summaries_for_least_regret(plain.least_regret, {})
