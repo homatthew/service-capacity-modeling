@@ -1410,22 +1410,137 @@ class CapacityPlanner:
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return self.plan_explained(
+        extra_model_arguments = extra_model_arguments or {}
+        pargs = planner_arguments or PlannerArguments(
+            max_results_per_family=max_results_per_family
+        )
+
+        if not all(0 <= p <= 100 for p in percentiles):
+            raise ValueError("percentiles must be an integer in the range [0, 100]")
+        if model_name not in self._models:
+            raise ValueError(
+                f"model_name={model_name} does not exist. "
+                f"Try {sorted(list(self._models.keys()))}"
+            )
+
+        regret_params = regret_params or self._default_regret_params
+        simulations = simulations or self._default_num_simulations
+        num_results = num_results or self._default_num_results
+        lifecycles = lifecycles or self._default_lifecycles
+
+        zonal_requirements: Dict[str, Dict[str, List[Interval]]] = {}
+        regional_requirements: Dict[str, Dict[str, List[Interval]]] = {}
+        regret_clusters_by_model: Dict[
+            str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
+        ] = {}
+        desires_by_model: Dict[str, CapacityDesires] = {}
+        excuses_by_model: Dict[str, List[Excuse]] = {}
+
+        for sub_model, sub_desires in self._sub_models(
             model_name=model_name,
+            desires=desires,
+            extra_model_arguments=extra_model_arguments,
+        ):
+            desires_by_model[sub_model] = sub_desires
+            world_plans: List[_WorldPlan] = []
+            model_excuses: List[Excuse] = []
+            for sim_desires in model_desires(sub_desires, simulations):
+                sim_result = self._plan_certain(
+                    model_name=sub_model,
+                    region=region,
+                    desires=sim_desires,
+                    num_results=1,
+                    num_regions=num_regions,
+                    extra_model_arguments=extra_model_arguments,
+                    lifecycles=lifecycles,
+                    instance_families=instance_families,
+                    drives=drives,
+                    planner_arguments=pargs,
+                )
+                model_excuses.extend(sim_result.excuses)
+                if sim_result.plans:
+                    world_plans.append(
+                        _WorldPlan(
+                            world=_world_ref_for_desires(sim_desires),
+                            desires=sim_desires,
+                            plan=sim_result.plans[0],
+                        )
+                    )
+            excuses_by_model[sub_model] = model_excuses
+            regret_clusters_by_model[sub_model] = _regret(
+                capacity_plans=world_plans,
+                regret_params=regret_params,
+                model=self._models[sub_model],
+            )
+
+        least_regret = reduce_by_family(
+            _merge_models(
+                [
+                    [plan[0] for plan in component]
+                    for component in regret_clusters_by_model.values()
+                ],
+                zonal_requirements,
+                regional_requirements,
+            ),
+            max_results_per_family=pargs.max_results_per_family,
+        )[:num_results]
+
+        low_p, high_p = sorted(percentiles)[0], sorted(percentiles)[-1]
+        final_zonal = []
+        final_regional = []
+        for req_type, samples in zonal_requirements.items():
+            req = CapacityRequirement(
+                requirement_type=req_type,
+                **{
+                    k: interval(samples=[i.mid for i in v], low_p=low_p, high_p=high_p)
+                    for k, v in samples.items()
+                },
+            )
+            final_zonal.append(req)
+        for req_type, samples in regional_requirements.items():
+            req = CapacityRequirement(
+                requirement_type=req_type,
+                **{
+                    k: interval(samples=[i.mid for i in v], low_p=low_p, high_p=high_p)
+                    for k, v in samples.items()
+                },
+            )
+            final_regional.append(req)
+
+        mean_plan, percentile_plans = self._plan_percentiles(
+            model_name=model_name,
+            percentiles=percentiles,
             region=region,
             desires=desires,
-            percentiles=percentiles,
-            simulations=simulations,
-            num_results=num_results,
-            num_regions=num_regions,
-            lifecycles=lifecycles,
-            instance_families=instance_families,
-            drives=drives,
-            regret_params=regret_params,
             extra_model_arguments=extra_model_arguments,
-            max_results_per_family=max_results_per_family,
-            planner_arguments=planner_arguments,
-        ).plan
+            num_regions=num_regions,
+            instance_families=instance_families,
+        )
+
+        return UncertainCapacityPlan(
+            requirements=Requirements(zonal=final_zonal, regional=final_regional),
+            least_regret=least_regret,
+            mean=mean_plan,
+            percentiles=percentile_plans,
+            explanation=PlanExplanation(
+                regret_params=regret_params,
+                desires_by_model={
+                    model: desires.merge_with(
+                        self._models[model].default_desires(
+                            desires_by_model[model], extra_model_arguments
+                        )
+                    )
+                    for model in regret_clusters_by_model
+                },
+                regret_clusters_by_model=regret_clusters_by_model,
+                excuses_by_model={
+                    model: deduplicate_excuses(excuses)
+                    for model, excuses in excuses_by_model.items()
+                    if excuses
+                },
+                context={"regret": least_regret},
+            ),
+        )
 
     def plan_explained(  # pylint: disable=too-many-positional-arguments
         self,
