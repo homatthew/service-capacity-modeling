@@ -161,3 +161,25 @@ def test_composed_explained_worlds_exist_in_all_models():
                 example_world.world_id in world_ids
                 for world_ids in world_ids_by_model.values()
             )
+
+
+def test_plan_explained_preserves_plan_output():
+    plain = planner.plan(
+        model_name="org.netflix.key-value",
+        region="us-east-1",
+        desires=uncertain_mid,
+        num_results=4,
+        simulations=12,
+    )
+    explained = planner.plan_explained(
+        model_name="org.netflix.key-value",
+        region="us-east-1",
+        desires=uncertain_mid,
+        num_results=4,
+        simulations=12,
+    )
+
+    assert explained.plan.least_regret == plain.least_regret
+    assert explained.plan.requirements == plain.requirements
+    assert explained.plan.mean == plain.mean
+    assert explained.plan.percentiles == plain.percentiles
