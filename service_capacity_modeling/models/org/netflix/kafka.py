@@ -269,7 +269,7 @@ def _estimate_kafka_cluster_zonal(  # noqa: C901
                 f"Instance too small: requires >={min_instance_cpu} vCPU "
                 f"and >={min_instance_memory_gib} GiB RAM"
             ),
-            bottleneck=bottleneck,
+            bottlenecks=[bottleneck],
         )
 
     # if we're not allowed to use attached disks, skip EBS only types
@@ -278,7 +278,7 @@ def _estimate_kafka_cluster_zonal(  # noqa: C901
             instance=instance.name,
             drive=drive.name,
             reason="Local disks required but instance has no ephemeral drive",
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # if we're not allowed to use local disks, skip ephems
@@ -287,7 +287,7 @@ def _estimate_kafka_cluster_zonal(  # noqa: C901
             instance=instance.name,
             drive=drive.name,
             reason="Attached disks required but instance has local ephemeral drive",
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # Kafka only deploys on gp3 drives right now
@@ -296,7 +296,7 @@ def _estimate_kafka_cluster_zonal(  # noqa: C901
             instance=instance.name,
             drive=drive.name,
             reason=f"Kafka requires gp3 drives; got {drive.name}",
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # If there is a current cluster, check if we are restricted to same instance family
@@ -446,7 +446,7 @@ def _estimate_kafka_cluster_zonal(  # noqa: C901
                 f"Cluster too large: {cluster.count} nodes/zone "
                 f"exceeds max {max_regional_size // zones_per_region}"
             ),
-            bottleneck=Bottleneck.disk_capacity,
+            bottlenecks=[Bottleneck.cluster_size, Bottleneck.disk_capacity],
             context={
                 "cluster_count": cluster.count,
                 "max_nodes_per_zone": max_regional_size // zones_per_region,

@@ -1467,6 +1467,21 @@ class ExcuseTag(StrEnum):
     """A different instance family from the current shape."""
 
 
+class SampleRef(ExcludeUnsetModel):
+    """Reference to a single simulated CapacityDesires sample.
+
+    A ``SampleRef`` lets downstream consumers correlate an emitted
+    ``Excuse`` (or a regret candidate) back to the specific simulated
+    desires it was produced from. The id is a deterministic hash of the
+    serialized desires so the same desires always produce the same id,
+    and the label summarizes the headline knobs (reads, writes, state)
+    for human readability.
+    """
+
+    sample_id: str
+    sample_label: str
+
+
 class Excuse(ExcludeUnsetModel):
     """Structured explanation for why an instance/drive combo was rejected."""
 
@@ -1475,16 +1490,54 @@ class Excuse(ExcludeUnsetModel):
     reason: str
     context: Dict[str, Any] = {}
     tags: List[ExcuseTag] = []
-    bottleneck: Optional[Bottleneck] = None
+    bottlenecks: List[Bottleneck] = []
+    """All binding bottlenecks for this rejection, in priority order
+    (most binding first). Empty list means no typed bottleneck info."""
+    frequency: int = 1
+    """Number of simulations in which this rejection occurred.
+
+    Defaults to 1 and is omitted from JSON when unset (via ExcludeUnsetModel).
+    Aggregated by ``deduplicate_excuses`` when combining excuses across
+    simulations from ``plan()``. A deterministic single pass
+    (``plan_certain_explained``) leaves this unset."""
+    sample_count: int = 1
+    """Number of distinct simulation samples that produced this rejection.
+
+    Aggregated by ``deduplicate_excuses`` from per-emission
+    ``example_samples`` entries. Distinct from ``frequency`` (raw
+    emission count): two emissions from the same sample bump frequency
+    but not sample_count. Defaults to 1 and is omitted from JSON when
+    unset (via ExcludeUnsetModel)."""
+    example_samples: List[SampleRef] = []
+    """A capped (\u22643) list of distinct simulation samples that produced
+    this rejection. Populated by the simulation loop in
+    ``plan()`` and aggregated by ``deduplicate_excuses``. Empty
+    when no sample plumbing ran (e.g. ``plan_certain_explained``)."""
+
+
+class ComposedExplanation(ExcludeUnsetModel):
+    """One node in the model composition tree.
+
+    Each node represents a (sub-)model invoked by the planner: the
+    desires it ran with, the excuses it emitted, the regret-ranked
+    candidate plans it produced, and any sub-models it composed with.
+
+    Tree shape preserves the compose_with relationship that the planner's
+    flat _sub_models yield previously discarded. Pre-order traversal
+    matches the legacy by-model-key iteration order.
+    """
+
+    model_name: str
+    desires: CapacityDesires
+    excuses: Sequence[Excuse] = []
+    regret_clusters: Sequence[Tuple[CapacityPlan, CapacityDesires, float]] = []
+    children: List["ComposedExplanation"] = []
 
 
 class PlanExplanation(ExcludeUnsetModel):
     regret_params: CapacityRegretParameters
-    regret_clusters_by_model: Dict[
-        str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
-    ] = {}
-    desires_by_model: Dict[str, CapacityDesires] = {}
-    excuses_by_model: Dict[str, Sequence[Excuse]] = {}
+    root: Optional[ComposedExplanation] = None
+    """Root of the composition tree. None when no models ran."""
     context: Dict[str, Any] = {}
 
 

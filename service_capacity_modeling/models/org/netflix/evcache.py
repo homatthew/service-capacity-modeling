@@ -233,7 +233,7 @@ def _estimate_evcache_cluster_zonal(  # noqa: C901,E501 pylint: disable=too-many
             instance=instance.name,
             drive=drive.name,
             reason=f"Instance too small: requires >=2 vCPU, got {instance.cpu}",
-            bottleneck=Bottleneck.cpu,
+            bottlenecks=[Bottleneck.cpu],
         )
 
     # EVCache doesn't like to deploy to instances with < 7 GiB of ram
@@ -245,7 +245,7 @@ def _estimate_evcache_cluster_zonal(  # noqa: C901,E501 pylint: disable=too-many
                 f"Insufficient memory: requires >={min_instance_memory_gib} GiB, "
                 f"got {instance.ram_gib:.1f} GiB"
             ),
-            bottleneck=Bottleneck.memory,
+            bottlenecks=[Bottleneck.memory],
         )
 
     # Based on the disk latency and the read latency SLOs we adjust our
@@ -283,7 +283,7 @@ def _estimate_evcache_cluster_zonal(  # noqa: C901,E501 pylint: disable=too-many
                 f"Workload requires {requirement.disk_gib.mid:.0f} GiB disk "
                 "but instance has no ephemeral drive"
             ),
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # Account for sidecars and base system memory
@@ -377,7 +377,7 @@ def _estimate_evcache_cluster_zonal(  # noqa: C901,E501 pylint: disable=too-many
                 f"Cluster too large: {cluster.count} nodes/zone "
                 f"exceeds max {max_regional_size // copies_per_region}"
             ),
-            bottleneck=Bottleneck.disk_capacity,
+            bottlenecks=[Bottleneck.cluster_size, Bottleneck.disk_capacity],
             context={
                 "cluster_count": cluster.count,
                 "max_nodes_per_zone": max_regional_size // copies_per_region,

@@ -11,6 +11,7 @@ from service_capacity_modeling.capacity_planner import planner
 from service_capacity_modeling.explainability import (
     ExplainedPlans,
     STATEFUL_DATASTORE_FAMILIES,
+    walk_explanations,
 )
 from service_capacity_modeling.interface import (
     Bottleneck,
@@ -78,7 +79,7 @@ class TestCassandraFamilyGraph:
             instance="i4i.4xlarge",
             drive="gp3",
             reason="Cluster too large",
-            bottleneck=Bottleneck.disk_capacity,
+            bottlenecks=[Bottleneck.disk_capacity],
         )
         alts = explained_plans.family_graph.suggest_alternatives(excuse)
         to_families = {a.to_family for a in alts}
@@ -101,44 +102,38 @@ class TestPlanCertainExplained:
             assert excuse.reason
 
     def test_excuses_use_bottleneck_enum(self, explained_plans):
-        typed_excuses = [e for e in explained_plans.excuses if e.bottleneck is not None]
+        typed_excuses = [e for e in explained_plans.excuses if e.bottlenecks]
         assert len(typed_excuses) > 0
         for excuse in typed_excuses:
-            assert isinstance(excuse.bottleneck, Bottleneck)
+            for b in excuse.bottlenecks:
+                assert isinstance(b, Bottleneck)
 
     def test_family_graph_is_populated(self, explained_plans):
         assert len(explained_plans.family_graph.traits) > 0
         assert len(explained_plans.family_graph.edges) > 0
 
 
-class TestPlanExplainFlag:
-    """Test that plan(explain=True) populates excuses_by_model."""
+class TestPlanExcuseAccumulation:
+    """Test that plan() now always populates excuses on the tree.
 
-    def test_plan_explain_includes_excuses(self):
+    The ``explain=True/False`` flag was removed in Layer G; excuse
+    accumulation is unconditional.
+    """
+
+    def test_plan_includes_excuses(self):
         result = planner.plan(
             model_name="org.netflix.cassandra",
             region="us-east-1",
             desires=small_workload,
             simulations=2,
-            explain=True,
             extra_model_arguments=EXTRA_MODEL_ARGS,
-        )
-        assert result.explanation.excuses_by_model, (
-            "explain=True should produce excuses for a real workload"
         )
         excuses_flat = [
-            e for es in result.explanation.excuses_by_model.values() for e in es
+            e
+            for node in walk_explanations(result.explanation.root)
+            for e in node.excuses
         ]
-        assert len(excuses_flat) > 0
-        assert all(isinstance(e, Excuse) for e in excuses_flat)
-
-    def test_plan_explain_false_has_no_excuses(self):
-        result = planner.plan(
-            model_name="org.netflix.cassandra",
-            region="us-east-1",
-            desires=small_workload,
-            simulations=2,
-            explain=False,
-            extra_model_arguments=EXTRA_MODEL_ARGS,
+        assert len(excuses_flat) > 0, (
+            "plan() should produce excuses unconditionally for a real workload"
         )
-        assert not result.explanation.excuses_by_model
+        assert all(isinstance(e, Excuse) for e in excuses_flat)
