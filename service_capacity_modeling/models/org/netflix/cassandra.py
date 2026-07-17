@@ -78,10 +78,43 @@ logger = logging.getLogger(__name__)
 
 BACKGROUND_BUFFER = "background"
 EBS_HOTTER = "EBS_HOTTER"
+CASSANDRA_DISK_UTILIZATION_LIMIT = "CASSANDRA_DISK_UTILIZATION_LIMIT"
 CRITICAL_TIERS: Set[int] = {0, 1}
 # cluster size aka nodes per ASG
 CRITICAL_TIER_MIN_CLUSTER_SIZE = 2
 EBS_HOTTER_BUFFER_RATIO = 0.5
+CASSANDRA_MAX_DISK_UTILIZATION = 0.55
+
+
+def _with_disk_utilization_buffer(
+    desires: CapacityDesires,
+    max_disk_utilization: float,
+) -> CapacityDesires:
+    """Add only the disk buffer needed to keep Cassandra below the utilization cap.
+
+    The default target leaves margin below the previous cap. Callers may make
+    this stricter but not looser.
+    """
+    capped_desires = desires.model_copy(deep=True)
+    target_disk_buffer_ratio = 1 / max_disk_utilization
+    existing_disk_buffer = buffer_for_components(
+        buffers=desires.buffers,
+        components=[BufferComponent.disk],
+    )
+    disk_utilization_ratio = (
+        target_disk_buffer_ratio
+        if not existing_disk_buffer.sources
+        else max(1.0, target_disk_buffer_ratio / existing_disk_buffer.ratio)
+    )
+    disk_utilization_buffer = Buffer(
+        ratio=disk_utilization_ratio,
+        components=[BufferComponent.disk],
+    )
+    capped_desires.buffers.desired = {
+        **capped_desires.buffers.desired,
+        CASSANDRA_DISK_UTILIZATION_LIMIT: disk_utilization_buffer,
+    }
+    return capped_desires
 
 
 def _with_ebs_hotter_buffer(desires: CapacityDesires) -> CapacityDesires:
@@ -621,23 +654,26 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     different_family_regret: float = 0.10,
     max_page_cache_gib: float = DEFAULT_MAX_PAGE_CACHE_GIB,
     backup_retention_days: Optional[float] = None,
+    max_disk_utilization: float = CASSANDRA_MAX_DISK_UTILIZATION,
+    min_instance_ram_gib_exclusive: float = 16.0,
 ) -> Union[CapacityPlan, Excuse, None]:
     drive_name = drive.name
 
     # Netflix Cassandra doesn't like to deploy on really small instances
-    if instance.cpu < 2 or instance.ram_gib <= 16:
+    if instance.cpu < 2 or instance.ram_gib <= min_instance_ram_gib_exclusive:
         return Excuse(
             instance=instance.name,
             drive=drive_name,
             reason=(
                 f"Instance too small: {instance.cpu} vCPUs "
-                f"(min 2), {instance.ram_gib:.0f} GiB RAM (requires > 16 GiB)"
+                f"(min 2), {instance.ram_gib:.2f} GiB RAM "
+                f"(requires > {min_instance_ram_gib_exclusive:g} GiB)"
             ),
             context={
                 "cpu": instance.cpu,
                 "ram_gib": instance.ram_gib,
                 "min_cpu": 2,
-                "min_ram_gib_exclusive": 16,
+                "min_ram_gib_exclusive": min_instance_ram_gib_exclusive,
             },
             bottleneck=Bottleneck.cpu if instance.cpu < 2 else Bottleneck.memory,
         )
@@ -715,6 +751,10 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
 
     is_ebs = instance.drive is None
     capacity_desires = _with_ebs_hotter_buffer(desires) if is_ebs else desires
+    capacity_desires = _with_disk_utilization_buffer(
+        capacity_desires,
+        max_disk_utilization,
+    )
     requirement_estimate = _estimate_cassandra_requirement(
         instance=instance,
         desires=capacity_desires,
@@ -1147,6 +1187,26 @@ class NflxCassandraArguments(BaseModel):
         "Default 14.0 (derived from LCS production clusters). Lower for TWCS or "
         "aggressive TTL workloads where SSTables expire before retention matters.",
     )
+    cost_write_per_second: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Fleet-wide average writes per second for bottom-up network "
+        "and backup pricing. Each regional cost extraction accounts for one "
+        "num_regions share. Recommendation planning continues to use the query "
+        "pattern for topology and service costs.",
+    )
+    cost_state_size_gib: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Average per-region logical state size in GiB used only by "
+        "bottom-up pricing for the existing per-zone backup snapshot. "
+        "Recommendation planning continues to use the data shape.",
+    )
+    min_instance_ram_gib_exclusive: float = Field(
+        default=16.0,
+        description="Exclusive minimum instance RAM (GiB) for Cassandra candidates. "
+        "Candidates with ram_gib <= this value are rejected.",
+    )
     adaptive_storage_buffer: bool = Field(
         default=True,
         description="Use a data-size-adaptive storage buffer instead of the fixed 4x. "
@@ -1190,6 +1250,15 @@ class NflxCassandraArguments(BaseModel):
         description="Allow existing Cassandra clusters on attached EBS volumes to "
         "recommend a smaller attached volume when requirements shrink. Defaults "
         "false to preserve the current EBS per-node disk floor.",
+    )
+    max_disk_utilization: float = Field(
+        default=CASSANDRA_MAX_DISK_UTILIZATION,
+        gt=0,
+        le=1.0,
+        description="Maximum planned disk utilization for provisioned Cassandra "
+        f"clusters. Defaults to {CASSANDRA_MAX_DISK_UTILIZATION:.0%}. "
+        "Lower values are more conservative; higher values allow denser current "
+        "shape planning.",
     )
 
     @model_validator(mode="after")
@@ -1295,12 +1364,19 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
         wire_write_size = _cassandra_wire_write_size(current_write_size)
         write_size_defaulted = _is_write_size_defaulted(desires)
 
-        # Adjust desires to use wire write size for network cost calculation.
-        # We copy desires rather than modifying the shared function in common.py,
-        # since the overhead is Cassandra-specific (other models use
-        # network_services() with their own wire formats).
-        adjusted_desires = desires.model_copy(deep=True)
-        adjusted_desires.query_pattern.estimated_mean_write_size_bytes = certain_int(
+        # Service costs can use average observed usage while capacity planning
+        # continues to use peak desires. The overrides are intentionally scoped
+        # to this private copy.
+        cost_desires = desires.model_copy(deep=True)
+        if args.cost_write_per_second is not None:
+            cost_desires.query_pattern.estimated_write_per_second = certain_float(
+                args.cost_write_per_second
+            )
+        if args.cost_state_size_gib is not None:
+            cost_desires.data_shape.estimated_state_size_gib = certain_float(
+                args.cost_state_size_gib
+            )
+        cost_desires.query_pattern.estimated_mean_write_size_bytes = certain_int(
             wire_write_size
         )
 
@@ -1313,9 +1389,14 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
         # defaulted, and how confident the model is in each cost component.
         # For now, service_params carries the flag per-service.
         net_services = network_services(
-            service_type, context, adjusted_desires, copies_per_region
+            service_type, context, cost_desires, copies_per_region
         )
         for svc in net_services:
+            if (
+                args.cost_write_per_second is not None
+                and svc.service_type == f"{service_type}.net.intra.region"
+            ):
+                svc.annual_cost /= max(context.num_regions, 1)
             svc.service_params["write_size_defaulted"] = write_size_defaulted
         services.extend(net_services)
 
@@ -1323,19 +1404,37 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             blob = context.services.get("blob.standard", None)
             if blob:
                 # Snapshot component: data-at-rest per zone
-                backup_disk_gib = max(
-                    1,
-                    _get_disk_from_desires(desires, copies_per_region)
-                    // context.zones_in_region,
-                )
+                if args.cost_state_size_gib is None:
+                    backup_disk_gib = max(
+                        1,
+                        _get_disk_from_desires(cost_desires, copies_per_region)
+                        // context.zones_in_region,
+                    )
+                else:
+                    backup_disk_gib = max(
+                        1,
+                        math.ceil(
+                            args.cost_state_size_gib
+                            * copies_per_region
+                            / context.zones_in_region
+                            / cost_desires.data_shape.estimated_compression_ratio.mid
+                        ),
+                    )
 
                 # Write-throughput component: backup storage is dominated by
                 # continuous SSTable uploads, not just the data-at-rest snapshot.
                 # Uses overhead-adjusted wire size because SSTables include
                 # full serialized mutations (cell metadata, timestamps, bloom
                 # filter contributions), not just raw app payload.
-                wps = desires.query_pattern.estimated_write_per_second.mid
-                daily_write_gib = (wps * wire_write_size * 86400) / (1024**3)
+                wps = cost_desires.query_pattern.estimated_write_per_second.mid
+                write_region_count = (
+                    max(context.num_regions, 1)
+                    if args.cost_write_per_second is not None
+                    else 1
+                )
+                daily_write_gib = (wps * wire_write_size * 86400) / (
+                    (1024**3) * write_region_count
+                )
                 retention_days = (
                     args.backup_retention_days or _DEFAULT_BACKUP_RETENTION_DAYS
                 )
@@ -1414,6 +1513,8 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             different_family_regret=args.different_family_regret,
             max_page_cache_gib=args.max_page_cache_gib,
             backup_retention_days=args.backup_retention_days,
+            max_disk_utilization=args.max_disk_utilization,
+            min_instance_ram_gib_exclusive=args.min_instance_ram_gib_exclusive,
         )
 
         return result
