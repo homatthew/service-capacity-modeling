@@ -292,3 +292,71 @@ def zonal_summary(zlr):
         zlr_cost,
         zlr_drive_gib,
     )
+
+
+def test_es_data_nodes_reject_shapes_with_no_ram_left_after_reserves():
+    """A big app reserve can swallow a shape that clears the 24 GiB floor.
+
+    r5d.xlarge has 31.7 GiB, so a 16 GiB app reserve plus the 1 GiB system
+    reserve plus the 15.85 GiB heap leaves nothing for shards or filesystem
+    cache. The shape has to be dropped before sizing a cluster out of it, while
+    the larger r5d shapes still have room.
+    """
+    app_mem_gib = 16
+    desires = CapacityDesires(
+        service_tier=1,
+        query_pattern=QueryPattern(estimated_read_per_second=certain_int(1000)),
+        data_shape=DataShape(
+            estimated_state_size_gib=certain_int(100),
+            reserved_instance_app_mem_gib=app_mem_gib,
+        ),
+    )
+    base_mem = app_mem_gib + desires.data_shape.reserved_instance_system_mem_gib
+    usable = {
+        name: shapes.instance(name).ram_gib
+        - (base_mem + min(32, shapes.instance(name).ram_gib / 2))
+        for name in ("r5d.xlarge", "r5d.2xlarge")
+    }
+    assert usable["r5d.xlarge"] <= 0 < usable["r5d.2xlarge"], (
+        f"reserving {app_mem_gib} GiB must overrun only r5d.xlarge here: {usable}"
+    )
+
+    plans = planner.plan_certain(
+        model_name="org.netflix.elasticsearch.node",
+        region="us-east-1",
+        desires=desires,
+        instance_families=["r5d"],
+    )
+    assert plans, "Expected the larger r5d shapes to still have RAM left"
+
+    for cluster in (
+        cluster for plan in plans for cluster in plan.candidate_clusters.zonal
+    ):
+        ram_gib = cluster.instance.ram_gib
+        reserved = base_mem + min(32, ram_gib / 2)
+        assert ram_gib > reserved, (
+            f"{cluster.instance.name} reserves {reserved} GiB of {ram_gib} GiB"
+        )
+
+
+def test_es_100_gib_plan_can_use_r5d_xlarge_data_nodes():
+    desires = CapacityDesires(
+        service_tier=1,
+        query_pattern=QueryPattern(estimated_read_per_second=certain_int(1000)),
+        data_shape=DataShape(estimated_state_size_gib=certain_int(100)),
+    )
+
+    plans = planner.plan_certain(
+        model_name="org.netflix.elasticsearch.node",
+        region="us-east-1",
+        desires=desires,
+        instance_families=["r5d"],
+        num_results=1,
+    )
+    data_clusters = plans[0].candidate_clusters.zonal
+
+    assert {cluster.instance.name for cluster in data_clusters} == {"r5d.xlarge"}
+    assert {
+        cluster.cluster_params["required_nodes_by_type"]["memory"]
+        for cluster in data_clusters
+    } == {1}

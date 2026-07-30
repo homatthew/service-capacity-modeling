@@ -1,3 +1,5 @@
+# pylint: disable=too-many-lines
+
 import pytest
 
 from service_capacity_modeling.capacity_planner import planner
@@ -15,11 +17,13 @@ from service_capacity_modeling.interface import Consistency
 from service_capacity_modeling.interface import CurrentClusters
 from service_capacity_modeling.interface import CurrentZoneClusterCapacity
 from service_capacity_modeling.interface import DataShape
+from service_capacity_modeling.interface import Excuse
 from service_capacity_modeling.interface import fixed_float
 from service_capacity_modeling.interface import FixedInterval
 from service_capacity_modeling.interface import GlobalConsistency
 from service_capacity_modeling.interface import Interval
 from service_capacity_modeling.interface import QueryPattern
+from service_capacity_modeling.interface import RegionContext
 from service_capacity_modeling.models.org.netflix.cassandra import (
     _default_cluster_size_mode,
     _get_cluster_size_lambda,
@@ -121,7 +125,8 @@ class TestCassandraCapacityPlanning:
             extra_model_arguments={**EXTRA_MODEL_ARGS, "copies_per_region": 2},
         )[0]
         high_writes_result = cap_plan.candidate_clusters.zonal[0]
-        assert high_writes_result.instance.family.startswith("c")
+        inst = high_writes_result.instance
+        assert inst.ram_gib / inst.cpu <= 4.5
 
         # Storage should be sufficient for the data (300 GiB with buffer)
         assert_minimum_storage_gib(high_writes_result, 400)
@@ -887,6 +892,49 @@ class TestCassandraExtraModelArguments:
         args = NflxCassandraArguments.from_extra_model_arguments({})
         assert args.max_page_cache_gib == 28.0
 
+    def test_min_instance_ram_gib_exclusive_default(self):
+        from service_capacity_modeling.models.org.netflix.cassandra import (
+            NflxCassandraArguments,
+        )
+
+        args = NflxCassandraArguments.from_extra_model_arguments({})
+        assert args.min_instance_ram_gib_exclusive == 16.0
+
+    def test_default_min_instance_ram_rejects_m6id_xlarge(self):
+        hardware = shapes.region("us-east-1")
+        result = NflxCassandraCapacityModel.capacity_plan(
+            instance=hardware.instances["m6id.xlarge"],
+            drive=hardware.drives["gp3"],
+            context=RegionContext(
+                zones_in_region=hardware.zones_in_region,
+                services=hardware.services,
+            ),
+            desires=small_but_high_qps,
+            extra_model_arguments={},
+        )
+
+        assert isinstance(result, Excuse)
+        assert result.context["ram_gib"] == 15.26
+        assert result.context["min_ram_gib_exclusive"] == 16.0
+        assert "requires > 16 GiB" in result.reason
+
+    def test_min_instance_ram_override_allows_m6id_xlarge(self):
+        hardware = shapes.region("us-east-1")
+        result = NflxCassandraCapacityModel.capacity_plan(
+            instance=hardware.instances["m6id.xlarge"],
+            drive=hardware.drives["gp3"],
+            context=RegionContext(
+                zones_in_region=hardware.zones_in_region,
+                services=hardware.services,
+            ),
+            desires=small_but_high_qps,
+            extra_model_arguments={"min_instance_ram_gib_exclusive": 15.0},
+        )
+
+        assert not isinstance(result, Excuse)
+        assert result is not None
+        assert result.candidate_clusters.zonal[0].instance.name == "m6id.xlarge"
+
     def test_cluster_size_mode_extra_argument(self):
         from service_capacity_modeling.models.org.netflix.cassandra import (
             NflxCassandraArguments,
@@ -947,3 +995,75 @@ class TestCassandraExtraModelArguments:
                 "description": CassandraClusterSizeMode.unrestricted.__doc__,
             },
         ]
+
+
+class TestCassandraServiceCosts:
+    @staticmethod
+    def _services(
+        *,
+        num_regions=4,
+        backup_retention_days=None,
+    ):
+        hardware = shapes.region("us-east-1")
+        desires = CapacityDesires(
+            query_pattern=QueryPattern(
+                estimated_write_per_second=certain_float(100),
+                estimated_mean_write_size_bytes=certain_int(512),
+            ),
+            data_shape=DataShape(estimated_state_size_gib=certain_float(300)),
+        )
+        return NflxCassandraCapacityModel.service_costs(
+            "cassandra",
+            RegionContext(
+                zones_in_region=hardware.zones_in_region,
+                num_regions=num_regions,
+                services=hardware.services,
+            ),
+            desires,
+            {
+                "backup_retention_days": backup_retention_days,
+            },
+        )
+
+    def test_service_costs_return_one_regional_share(self):
+        one_region = {
+            service.service_type: service for service in self._services(num_regions=1)
+        }
+        four_regions = {
+            service.service_type: service for service in self._services(num_regions=4)
+        }
+
+        assert four_regions["cassandra.net.intra.region"].annual_cost == pytest.approx(
+            one_region["cassandra.net.intra.region"].annual_cost / 4
+        )
+        assert (
+            four_regions["cassandra.backup.s3-standard"].service_params["snapshot_gib"]
+            == one_region["cassandra.backup.s3-standard"].service_params["snapshot_gib"]
+        )
+        assert four_regions["cassandra.backup.s3-standard"].service_params[
+            "daily_write_gib"
+        ] == pytest.approx(
+            one_region["cassandra.backup.s3-standard"].service_params["daily_write_gib"]
+            / 4,
+            abs=0.1,
+        )
+
+    def test_backup_retention_controls_backup_service_cost(self):
+        enabled = {service.service_type: service for service in self._services()}
+        seven_days = {
+            service.service_type: service
+            for service in self._services(backup_retention_days=7)
+        }
+        disabled = {
+            service.service_type: service
+            for service in self._services(backup_retention_days=0)
+        }
+
+        assert "cassandra.backup.s3-standard" in enabled
+        assert (
+            seven_days["cassandra.backup.s3-standard"].service_params["retention_days"]
+            == 7
+        )
+        assert "cassandra.backup.s3-standard" not in disabled
+        assert "cassandra.net.inter.region" in disabled
+        assert "cassandra.net.intra.region" in disabled

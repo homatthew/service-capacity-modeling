@@ -44,7 +44,12 @@ def test_cluster_size_excuse_has_resource_bottleneck_details():
         extra_model_arguments={"required_cluster_size": 2, "require_local_disks": True},
         num_results=5,
     )
-    excuses = [e for e in explained.excuses if "resource bottleneck:" in e.reason]
+    excuses = [
+        e
+        for es in explained.excuses_by_model.values()
+        for e in es
+        if "resource bottleneck:" in e.reason
+    ]
     assert excuses, "Expected cluster_size excuses with count bottleneck details"
     for e in excuses:
         counts = e.context["required_nodes_by_type"]
@@ -344,3 +349,44 @@ def test_memory_scale_down_caps_write_buffer():
                 f"<= uncapped ({uncapped_mem}) for {capped_zone.instance.name}"
             )
             break
+
+
+def test_shape_without_page_cache_is_excused():
+    """Large reserved app memory can leave a shape with no page cache at all.
+
+    i4i.xlarge holds 30.52 GiB: a 15 GiB heap plus 25 GiB of reserved app and
+    system memory overruns the box, so page cache capacity clamps to zero.
+    Sizing a cluster out of that shape used to divide by zero, so the shape has
+    to be excused before it reaches compute_stateful_zone.
+    """
+    desires = CapacityDesires(
+        service_tier=0,
+        query_pattern=QueryPattern(
+            access_pattern=AccessPattern.latency,
+            estimated_read_per_second=certain_int(2870),
+            estimated_write_per_second=certain_int(1381),
+        ),
+        data_shape=DataShape(
+            estimated_state_size_gib=certain_int(15205),
+            reserved_instance_app_mem_gib=24,
+        ),
+    )
+
+    explained = planner.plan_certain_explained(
+        model_name="org.netflix.cassandra",
+        region="us-east-1",
+        desires=desires,
+    )
+
+    assert explained.plans, "Larger shapes should still produce plans"
+
+    excused = {
+        e.instance
+        for excuses in explained.excuses_by_model.values()
+        for e in excuses
+        if "No page cache left" in e.reason
+    }
+    assert "i4i.xlarge" in excused
+
+    for plan in explained.plans:
+        assert plan.candidate_clusters.zonal[0].instance.ram_gib > 40

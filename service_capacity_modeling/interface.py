@@ -825,7 +825,7 @@ class DataShape(ExcludeUnsetModel):
     Note: databases may have different compression strategies affecting this."""
 
     reserved_instance_app_mem_gib: float = 2
-    """Fixed memory per instance for application (e.g. process heap memory)"""
+    """Fixed application memory per instance of the model's own tier."""
 
     reserved_instance_system_mem_gib: float = 1
     """Fixed memory per instance for system (e.g. kernel and system processes)"""
@@ -1477,6 +1477,51 @@ class Excuse(ExcludeUnsetModel):
     tags: List[ExcuseTag] = []
     bottleneck: Optional[Bottleneck] = None
 
+    def dedupe_key(self) -> Tuple[str, str, str, Optional[Bottleneck], Tuple[str, ...]]:
+        """Identity for deduping/grouping excuses across simulations.
+
+        Keyed on the fields that define *why* a shape was rejected:
+        instance, drive, reason, bottleneck, and tags. context is excluded
+        because it holds sample-specific numbers that differ between
+        simulations, so the same rejection collapses to one entry instead
+        of one per sample.
+        """
+        return (
+            self.instance,
+            self.drive,
+            self.reason,
+            self.bottleneck,
+            tuple(sorted(tag.value for tag in self.tags)),
+        )
+
+
+class SampleRef(ExcludeUnsetModel):
+    """Stable reference to one sampled input in the uncertain planner."""
+
+    sample_id: str
+    sample_label: str
+
+
+class ExcuseSummary(Excuse):
+    """An excuse plus how often it appeared across simulations."""
+
+    source_model: Optional[str] = None
+    occurrence_count: int = 1
+    sample_count: int = 1
+    example_samples: Sequence[SampleRef] = Field(default_factory=list)
+
+
+class RegretPlanSummary(ExcludeUnsetModel):
+    """Aggregated regret summary for one returned plan shape."""
+
+    plan: CapacityPlan
+    sample_count: int = 1
+    mean_total_regret: float
+    mean_regret_components_by_model: Dict[str, Dict[str, float]] = Field(
+        default_factory=dict
+    )
+    example_samples: Sequence[SampleRef] = Field(default_factory=list)
+
 
 class PlanExplanation(ExcludeUnsetModel):
     regret_params: CapacityRegretParameters
@@ -1484,6 +1529,7 @@ class PlanExplanation(ExcludeUnsetModel):
         str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
     ] = {}
     desires_by_model: Dict[str, CapacityDesires] = {}
+    """The base desires actually planned for each model in the composition."""
     excuses_by_model: Dict[str, Sequence[Excuse]] = {}
     context: Dict[str, Any] = {}
 

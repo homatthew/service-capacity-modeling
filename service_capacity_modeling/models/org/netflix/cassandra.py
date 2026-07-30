@@ -78,10 +78,43 @@ logger = logging.getLogger(__name__)
 
 BACKGROUND_BUFFER = "background"
 EBS_HOTTER = "EBS_HOTTER"
+CASSANDRA_DISK_UTILIZATION_LIMIT = "CASSANDRA_DISK_UTILIZATION_LIMIT"
 CRITICAL_TIERS: Set[int] = {0, 1}
 # cluster size aka nodes per ASG
 CRITICAL_TIER_MIN_CLUSTER_SIZE = 2
 EBS_HOTTER_BUFFER_RATIO = 0.5
+CASSANDRA_MAX_DISK_UTILIZATION = 0.55
+
+
+def _with_disk_utilization_buffer(
+    desires: CapacityDesires,
+    max_disk_utilization: float,
+) -> CapacityDesires:
+    """Add only the disk buffer needed to keep Cassandra below the utilization cap.
+
+    The default target leaves margin below the previous cap. Callers may make
+    this stricter but not looser.
+    """
+    capped_desires = desires.model_copy(deep=True)
+    target_disk_buffer_ratio = 1 / max_disk_utilization
+    existing_disk_buffer = buffer_for_components(
+        buffers=desires.buffers,
+        components=[BufferComponent.disk],
+    )
+    disk_utilization_ratio = (
+        target_disk_buffer_ratio
+        if not existing_disk_buffer.sources
+        else max(1.0, target_disk_buffer_ratio / existing_disk_buffer.ratio)
+    )
+    disk_utilization_buffer = Buffer(
+        ratio=disk_utilization_ratio,
+        components=[BufferComponent.disk],
+    )
+    capped_desires.buffers.desired = {
+        **capped_desires.buffers.desired,
+        CASSANDRA_DISK_UTILIZATION_LIMIT: disk_utilization_buffer,
+    }
+    return capped_desires
 
 
 def _with_ebs_hotter_buffer(desires: CapacityDesires) -> CapacityDesires:
@@ -621,25 +654,55 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
     different_family_regret: float = 0.10,
     max_page_cache_gib: float = DEFAULT_MAX_PAGE_CACHE_GIB,
     backup_retention_days: Optional[float] = None,
+    max_disk_utilization: float = CASSANDRA_MAX_DISK_UTILIZATION,
+    min_instance_ram_gib_exclusive: float = 16.0,
 ) -> Union[CapacityPlan, Excuse, None]:
     drive_name = drive.name
 
     # Netflix Cassandra doesn't like to deploy on really small instances
-    if instance.cpu < 2 or instance.ram_gib <= 16:
+    if instance.cpu < 2 or instance.ram_gib <= min_instance_ram_gib_exclusive:
         return Excuse(
             instance=instance.name,
             drive=drive_name,
             reason=(
                 f"Instance too small: {instance.cpu} vCPUs "
-                f"(min 2), {instance.ram_gib:.0f} GiB RAM (requires > 16 GiB)"
+                f"(min 2), {instance.ram_gib:.2f} GiB RAM "
+                f"(requires > {min_instance_ram_gib_exclusive:g} GiB)"
             ),
             context={
                 "cpu": instance.cpu,
                 "ram_gib": instance.ram_gib,
                 "min_cpu": 2,
-                "min_ram_gib_exclusive": 16,
+                "min_ram_gib_exclusive": min_instance_ram_gib_exclusive,
             },
             bottleneck=Bottleneck.cpu if instance.cpu < 2 else Bottleneck.memory,
+        )
+
+    # The 16 GiB floor above is workload independent, but the reserved app and
+    # system memory is not. Once the JVM heap and those reserves are carved out
+    # there has to be RAM left for page cache, otherwise Cassandra has nowhere
+    # to keep its working set and this shape cannot run the workload at all.
+    base_mem = base_memory_gib(desires)
+    node_memory = MemoryLayout.for_ram(
+        ram_gib=instance.ram_gib,
+        base_reserves_gib=base_mem,
+        max_page_cache_gib=max_page_cache_gib,
+    )
+    if node_memory.page_cache_capacity_gib <= 0:
+        return Excuse(
+            instance=instance.name,
+            drive=drive_name,
+            reason=(
+                f"No page cache left: {instance.ram_gib:.0f} GiB RAM - "
+                f"{node_memory.heap_gib:.0f} GiB heap - {base_mem:.0f} GiB "
+                f"reserved app and system memory"
+            ),
+            context={
+                "ram_gib": instance.ram_gib,
+                "heap_gib": node_memory.heap_gib,
+                "base_reserves_gib": base_mem,
+            },
+            bottleneck=Bottleneck.memory,
         )
 
     # if we're not allowed to use gp2, skip EBS only types
@@ -715,6 +778,10 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
 
     is_ebs = instance.drive is None
     capacity_desires = _with_ebs_hotter_buffer(desires) if is_ebs else desires
+    capacity_desires = _with_disk_utilization_buffer(
+        capacity_desires,
+        max_disk_utilization,
+    )
     requirement_estimate = _estimate_cassandra_requirement(
         instance=instance,
         desires=capacity_desires,
@@ -781,8 +848,6 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
         disk_per_node_gib=effective_disk_per_node_gib,
         cluster_size_lambda=cluster_size_lambda,
     )
-
-    base_mem = base_memory_gib(desires)
 
     @lru_cache(maxsize=None)
     def memory_layout(ram_gib: float) -> MemoryLayout:
@@ -1143,9 +1208,17 @@ class NflxCassandraArguments(BaseModel):
     )
     backup_retention_days: Optional[float] = Field(
         default=None,
-        description="Effective backup retention in days for write-throughput backup cost. "
-        "Default 14.0 (derived from LCS production clusters). Lower for TWCS or "
-        "aggressive TTL workloads where SSTables expire before retention matters.",
+        ge=0,
+        description="Effective backup retention in days for write-throughput backup "
+        "cost. None uses the 14.0-day default derived from LCS production clusters; "
+        "zero disables backup cost; a positive value sets the effective regional "
+        "retention. Use a lower positive value for TWCS or aggressive TTL workloads "
+        "where SSTables expire before retention matters.",
+    )
+    min_instance_ram_gib_exclusive: float = Field(
+        default=16.0,
+        description="Exclusive minimum instance RAM (GiB) for Cassandra candidates. "
+        "Candidates with ram_gib <= this value are rejected.",
     )
     adaptive_storage_buffer: bool = Field(
         default=True,
@@ -1190,6 +1263,15 @@ class NflxCassandraArguments(BaseModel):
         description="Allow existing Cassandra clusters on attached EBS volumes to "
         "recommend a smaller attached volume when requirements shrink. Defaults "
         "false to preserve the current EBS per-node disk floor.",
+    )
+    max_disk_utilization: float = Field(
+        default=CASSANDRA_MAX_DISK_UTILIZATION,
+        gt=0,
+        le=1.0,
+        description="Maximum planned disk utilization for provisioned Cassandra "
+        f"clusters. Defaults to {CASSANDRA_MAX_DISK_UTILIZATION:.0%}. "
+        "Lower values are more conservative; higher values allow denser current "
+        "shape planning.",
     )
 
     @model_validator(mode="after")
@@ -1282,7 +1364,14 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
         desires: CapacityDesires,
         extra_model_arguments: Dict[str, Any],
     ) -> List[ServiceCapacity]:
-        # C* service costs: network + backup
+        """Estimate Cassandra network and backup costs for one regional plan.
+
+        Cassandra treats the query pattern's write rate as a fleetwide total for
+        service costing. Each regional plan returns its additive share of network
+        and backup write-throughput costs so summing all regions recovers the
+        fleetwide cost. The schema-backed ``backup_retention_days`` argument owns
+        backup inclusion and retention; it does not affect network costs.
+        """
         args = NflxCassandraArguments.from_extra_model_arguments(extra_model_arguments)
         copies_per_region: int = _target_rf(
             desires, extra_model_arguments.get("copies_per_region")
@@ -1316,10 +1405,15 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             service_type, context, adjusted_desires, copies_per_region
         )
         for svc in net_services:
+            if svc.service_type == f"{service_type}.net.intra.region":
+                svc.annual_cost /= max(context.num_regions, 1)
             svc.service_params["write_size_defaulted"] = write_size_defaulted
         services.extend(net_services)
 
-        if desires.data_shape.durability_slo_order.mid >= 1000:
+        if (
+            args.backup_retention_days != 0
+            and desires.data_shape.durability_slo_order.mid >= 1000
+        ):
             blob = context.services.get("blob.standard", None)
             if blob:
                 # Snapshot component: data-at-rest per zone
@@ -1335,9 +1429,14 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
                 # full serialized mutations (cell metadata, timestamps, bloom
                 # filter contributions), not just raw app payload.
                 wps = desires.query_pattern.estimated_write_per_second.mid
-                daily_write_gib = (wps * wire_write_size * 86400) / (1024**3)
+                write_region_count = max(context.num_regions, 1)
+                daily_write_gib = (wps * wire_write_size * 86400) / (
+                    (1024**3) * write_region_count
+                )
                 retention_days = (
-                    args.backup_retention_days or _DEFAULT_BACKUP_RETENTION_DAYS
+                    _DEFAULT_BACKUP_RETENTION_DAYS
+                    if args.backup_retention_days is None
+                    else args.backup_retention_days
                 )
 
                 # Total = state snapshot + retained write volume
@@ -1414,6 +1513,8 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
             different_family_regret=args.different_family_regret,
             max_page_cache_gib=args.max_page_cache_gib,
             backup_retention_days=args.backup_retention_days,
+            max_disk_utilization=args.max_disk_utilization,
+            min_instance_ram_gib_exclusive=args.min_instance_ram_gib_exclusive,
         )
 
         return result
