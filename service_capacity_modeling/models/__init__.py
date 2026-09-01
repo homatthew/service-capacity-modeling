@@ -10,6 +10,7 @@ from typing import Union
 
 from service_capacity_modeling.interface import AccessConsistency
 from service_capacity_modeling.interface import AccessPattern
+from service_capacity_modeling.interface import Bottleneck
 from service_capacity_modeling.interface import CapacityDesires
 from service_capacity_modeling.interface import CapacityPlan
 from service_capacity_modeling.interface import CapacityRegretParameters
@@ -26,6 +27,9 @@ from service_capacity_modeling.interface import QueryPattern
 from service_capacity_modeling.interface import ClusterCapacity
 from service_capacity_modeling.interface import RegionContext
 from service_capacity_modeling.interface import ServiceCapacity
+from service_capacity_modeling.explainability import FamilyTrait
+from service_capacity_modeling.explainability import ModelExplanation
+from service_capacity_modeling.explainability import PreferredFamilies
 from service_capacity_modeling.models.common import cluster_infra_cost
 
 # Shared constant for rank penalty metadata in cluster_params.
@@ -196,13 +200,19 @@ class CapacityModel:
         return None
 
     @staticmethod
-    def preferred_families() -> Optional[FrozenSet[str]]:
+    def preferred_families() -> Optional[Union[FrozenSet[str], PreferredFamilies]]:
         """Instance families this model prefers for capacity planning.
 
-        Returns None if the model has no family preference (graph will contain
-        only the current cluster's family, and no rank bias is applied).
-        Override to declare the model's preferred family set. The planner uses
-        this for two purposes — both are automatic and require no per-model code:
+        Returns None when the model has no preference. Returns a
+        FrozenSet[str] for a static preference, or a PreferredFamilies for a
+        composable one (preset + add - remove). The planner resolves both
+        shapes uniformly via the same FamilyGraph.build path; in-tree models
+        may continue returning FrozenSet[str].
+
+        With no preference (None) the graph will contain only the current
+        cluster's family and no rank bias is applied. Override to declare
+        the model's preferred family set. The planner uses this for two
+        purposes — both are automatic and require no per-model code:
 
         1. Family graph topology: nodes in plan_certain_explained().family_graph
            come from this set (plus the current cluster's family).
@@ -210,6 +220,49 @@ class CapacityModel:
            rank inflation on compute cost. A non-preferred family must be
            ~15% cheaper on compute to rank above a preferred one.
         """
+        return None
+
+    @staticmethod
+    def derive_family_traits(family: str, instance: Instance) -> Dict[str, Any]:
+        """Optional model-specific trait extras attached to FamilyTrait.context.
+
+        Called once per family by the planner when building the family graph.
+        Returning an empty dict (default) leaves FamilyTrait.context unset.
+        """
+        _ = (family, instance)
+        return {}
+
+    @staticmethod
+    def derive_family_edge(
+        from_trait: "FamilyTrait",
+        to_trait: "FamilyTrait",
+        default_improves: List[Bottleneck],
+        default_degrades: List[Bottleneck],
+    ) -> Tuple[List[Bottleneck], List[Bottleneck], Dict[str, Any]]:
+        """Optional override/augment of family-edge derivation.
+
+        Receives the framework's computed (improves, degrades) and returns
+        (improves, degrades, context). Default: pass through unchanged with
+        empty context.
+        """
+        _ = (from_trait, to_trait)
+        return default_improves, default_degrades, {}
+
+    @staticmethod
+    def explain_plan(
+        plan: CapacityPlan,
+        desires: CapacityDesires,
+        extra_model_arguments: Dict[str, Any],
+    ) -> Optional["ModelExplanation"]:
+        """Optional model-specific explanation payload for this plan.
+
+        Called by the planner after ``capacity_plan`` has produced a chosen
+        plan, before plans are merged across composed sub-models. Models
+        should return a ModelExplanation (or a typed subclass) to surface
+        reasoning that doesn't fit the generic Excuse / CapacityRequirement
+        schemas. Default: None.
+        """
+        _ = (plan, desires, extra_model_arguments)
         return None
 
     @staticmethod

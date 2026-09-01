@@ -1,8 +1,19 @@
 from service_capacity_modeling.capacity_planner import planner
+from service_capacity_modeling.explainability import walk_explanations
 from service_capacity_modeling.interface import CapacityDesires
 from service_capacity_modeling.interface import DataShape
 from service_capacity_modeling.interface import Interval
 from service_capacity_modeling.interface import QueryPattern
+
+
+def _find_regret_clusters(result, model_name):
+    """Locate a sub-model's regret clusters in the explanation tree."""
+    for node in walk_explanations(result.explanation.root):
+        if node.model_name == model_name:
+            return node.regret_clusters
+    raise AssertionError(
+        f"No ComposedExplanation node for {model_name!r} found in tree"
+    )
 
 
 uncertain_mid = CapacityDesires(
@@ -54,24 +65,18 @@ def test_compositional():
         region="us-east-1",
         desires=uncertain_mid,
         num_results=4,
-        explain=True,
     )
     composed_result = planner.plan(
         model_name="org.netflix.key-value",
         region="us-east-1",
         desires=uncertain_mid,
         num_results=4,
-        explain=True,
     )
 
     # Strictest test: Cassandra regret clusters must be EXACTLY identical
     # (same plans, same regrets, same order) since key-value uses `lambda x: x`
-    direct_cass = direct_result.explanation.regret_clusters_by_model[
-        "org.netflix.cassandra"
-    ]
-    composed_cass = composed_result.explanation.regret_clusters_by_model[
-        "org.netflix.cassandra"
-    ]
+    direct_cass = _find_regret_clusters(direct_result, "org.netflix.cassandra")
+    composed_cass = _find_regret_clusters(composed_result, "org.netflix.cassandra")
     assert len(direct_cass) == len(composed_cass)
     for i, ((d_plan, _, d_regret), (c_plan, _, c_regret)) in enumerate(
         zip(direct_cass, composed_cass)

@@ -5,7 +5,6 @@ from functools import lru_cache
 from typing import Any
 from typing import Callable
 from typing import Dict
-from typing import FrozenSet
 from typing import List
 from typing import Optional
 from typing import Tuple
@@ -35,7 +34,8 @@ from service_capacity_modeling.interface import CurrentClusterCapacity
 from service_capacity_modeling.interface import DataShape
 from service_capacity_modeling.interface import Drive
 from service_capacity_modeling.interface import Bottleneck
-from service_capacity_modeling.explainability import STATEFUL_DATASTORE_FAMILIES
+from service_capacity_modeling.explainability import FamilyPreset
+from service_capacity_modeling.explainability import PreferredFamilies
 from service_capacity_modeling.interface import Excuse
 from service_capacity_modeling.interface import FixedInterval
 from service_capacity_modeling.interface import GlobalConsistency
@@ -639,7 +639,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "min_cpu": 2,
                 "min_ram_gib_exclusive": 16,
             },
-            bottleneck=Bottleneck.cpu if instance.cpu < 2 else Bottleneck.memory,
+            bottlenecks=[Bottleneck.cpu if instance.cpu < 2 else Bottleneck.memory],
         )
 
     # if we're not allowed to use gp2, skip EBS only types
@@ -652,7 +652,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "has_local_drive": False,
                 "require_local_disks": True,
             },
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # if we're not allowed to use local disks, skip ephems
@@ -665,7 +665,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "instance_drive": str(instance.drive),
                 "require_attached_disks": True,
             },
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     # Cassandra deploys on gp3 only (gp2 is legacy)
@@ -678,7 +678,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "drive_name": drive_name,
                 "supported_drives": ["gp3"],
             },
-            bottleneck=Bottleneck.drive_type,
+            bottlenecks=[Bottleneck.drive_type],
         )
 
     rps = desires.query_pattern.estimated_read_per_second.mid // zones_per_region
@@ -889,7 +889,11 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "required_nodes_by_type": required_nodes_by_type,
                 "resource_bottleneck": resource_bottleneck,
             },
-            bottleneck=Bottleneck.cluster_size,
+            bottlenecks=(
+                [Bottleneck.cluster_size, Bottleneck(resource_bottleneck)]
+                if resource_bottleneck != "unknown"
+                else [Bottleneck.cluster_size]
+            ),
         )
 
     # Cassandra clusters generally should try to stay under some total number
@@ -914,7 +918,7 @@ def _estimate_cassandra_cluster_zonal(  # pylint: disable=too-many-positional-ar
                 "needed_disk_gib": needed_disk_gib,
                 "disk_per_node_gib": effective_disk_per_node_gib,
             },
-            bottleneck=Bottleneck.disk_capacity,
+            bottlenecks=[Bottleneck.cluster_size, Bottleneck.disk_capacity],
         )
 
     # Calculate service costs (network + backup)
@@ -1243,8 +1247,8 @@ class NflxCassandraCapacityModel(CapacityModel, CostAwareModel):
         return ("gp3",)
 
     @staticmethod
-    def preferred_families() -> Optional[FrozenSet[str]]:
-        return STATEFUL_DATASTORE_FAMILIES
+    def preferred_families() -> Optional[PreferredFamilies]:
+        return PreferredFamilies(preset=FamilyPreset.stateful_datastore)
 
     @staticmethod
     def get_required_cluster_size(

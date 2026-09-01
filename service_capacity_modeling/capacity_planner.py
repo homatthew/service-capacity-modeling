@@ -8,6 +8,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Dict
+from typing import FrozenSet
 from typing import Generator
 from typing import List
 from typing import Optional
@@ -15,7 +16,6 @@ from typing import Sequence
 from typing import Set
 from typing import Tuple
 
-import numpy as np
 from pydantic import Field
 
 from service_capacity_modeling.hardware import HardwareShapes
@@ -27,6 +27,7 @@ from service_capacity_modeling.interface import CapacityRequirement
 from service_capacity_modeling.interface import certain_float
 from service_capacity_modeling.interface import ClusterCapacity
 from service_capacity_modeling.interface import Clusters
+from service_capacity_modeling.interface import ComposedExplanation
 from service_capacity_modeling.interface import CurrentClusterCapacity
 from service_capacity_modeling.interface import DataShape
 from service_capacity_modeling.interface import Drive
@@ -34,7 +35,11 @@ from service_capacity_modeling.interface import ExcludeUnsetModel
 from service_capacity_modeling.interface import Excuse
 from service_capacity_modeling.explainability import deduplicate_excuses
 from service_capacity_modeling.explainability import ExplainedPlans
+from service_capacity_modeling.explainability import ExplainedUncertainPlans
 from service_capacity_modeling.explainability import FamilyGraph
+from service_capacity_modeling.explainability import ModelExplanation
+from service_capacity_modeling.explainability import PreferredFamilies
+from service_capacity_modeling.explainability import walk_explanations
 from service_capacity_modeling.interface import Hardware
 from service_capacity_modeling.interface import Instance
 from service_capacity_modeling.interface import Interval
@@ -46,6 +51,7 @@ from service_capacity_modeling.interface import QueryPattern
 from service_capacity_modeling.interface import RegionClusterCapacity
 from service_capacity_modeling.interface import RegionContext
 from service_capacity_modeling.interface import Requirements
+from service_capacity_modeling.interface import SampleRef
 from service_capacity_modeling.interface import ServiceCapacity
 from service_capacity_modeling.interface import UncertainCapacityPlan
 from service_capacity_modeling.interface import ZoneClusterCapacity
@@ -57,10 +63,95 @@ from service_capacity_modeling.models.org import netflix
 from service_capacity_modeling.models.utils import compute_excuse_tags
 from service_capacity_modeling.models.utils import current_instance_name
 from service_capacity_modeling.models.utils import reduce_by_family
+from service_capacity_modeling.regret_explainability import (
+    considered_alternative_summaries,
+)
+from service_capacity_modeling.regret_explainability import (
+    merge_regret_candidates_positional,
+)
+from service_capacity_modeling.regret_explainability import RegretCandidate
+from service_capacity_modeling.regret_explainability import regret_detailed
+from service_capacity_modeling.regret_explainability import SampledPlan
+from service_capacity_modeling.regret_explainability import (
+    summaries_for_least_regret,
+)
+from service_capacity_modeling.regret_explainability import topology_signature
 from service_capacity_modeling.stats import dist_for_interval
 from service_capacity_modeling.stats import interval_percentile
 
 logger = logging.getLogger(__name__)
+
+
+def _format_sample_value(value: float, suffix: str = "") -> str:
+    """Render a sample magnitude with k/M/B scaling for compact labels.
+
+    Used by ``_sample_ref_for_desires`` to keep ``SampleRef.sample_label``
+    short and grep-friendly while preserving the order of magnitude.
+    Values are scaled into the nearest larger SI step (k/M/B) and
+    rounded to an integer. The ``suffix`` is appended verbatim after the
+    scale unit (e.g. ``"GiB"``).
+    """
+    abs_value = abs(value)
+    if abs_value >= 1e9:
+        return f"{value / 1e9:.0f}B{suffix}"
+    if abs_value >= 1e6:
+        return f"{value / 1e6:.0f}M{suffix}"
+    if abs_value >= 1e3:
+        return f"{value / 1e3:.0f}k{suffix}"
+    return f"{value:.0f}{suffix}"
+
+
+def _sample_ref_for_desires(desires: CapacityDesires, index: int) -> SampleRef:
+    """Build a deterministic ``SampleRef`` for a single simulated desires.
+
+    ``sample_id`` is ``f"s-{index:04d}-{blake2b8hex}"`` where the digest
+    is taken over ``desires.model_dump_json()``. The same desires + index
+    therefore always produce the same id, which lets tests and consumers
+    correlate excuses across runs. ``sample_label`` summarizes the three
+    headline knobs (mid reads/s, mid writes/s, mid state in GiB) using
+    ``_format_sample_value``.
+    """
+    payload = desires.model_dump_json().encode()
+    digest = blake2b(payload, digest_size=4).hexdigest()
+    sample_id = f"s-{index:04d}-{digest}"
+
+    qp = desires.query_pattern
+    ds = desires.data_shape
+    reads_label = _format_sample_value(qp.estimated_read_per_second.mid)
+    writes_label = _format_sample_value(qp.estimated_write_per_second.mid)
+    state_label = _format_sample_value(ds.estimated_state_size_gib.mid, suffix="GiB")
+    sample_label = f"reads={reads_label} writes={writes_label} state={state_label}"
+    return SampleRef(sample_id=sample_id, sample_label=sample_label)
+
+
+def _resolve_preferred_families(
+    model: CapacityModel,
+    extra_model_arguments: Dict[str, Any],
+) -> Optional[FrozenSet[str]]:
+    """Resolve effective preferred families for the planner.
+
+    Precedence:
+      1. ``extra_model_arguments["preferred_families_override"]`` (must be a
+         ``PreferredFamilies`` instance), if present and not resolving to
+         ``None``.
+      2. ``model.preferred_families()`` — which may return ``FrozenSet[str]``,
+         ``PreferredFamilies``, or ``None``.
+
+    Returns:
+      Optional[FrozenSet[str]]: ``None`` when no preference; otherwise a
+      concrete (possibly empty) frozenset suitable for ``FamilyGraph.build``.
+    """
+    override = extra_model_arguments.get("preferred_families_override")
+    if isinstance(override, PreferredFamilies):
+        resolved = override.resolve()
+        if resolved is not None:
+            return resolved
+    pref = model.preferred_families()
+    if pref is None:
+        return None
+    if isinstance(pref, PreferredFamilies):
+        return pref.resolve()
+    return frozenset(pref)
 
 
 class PlannerArguments(ExcludeUnsetModel):
@@ -379,31 +470,24 @@ def _regret(
     regret_params: CapacityRegretParameters,
     model: CapacityModel,
 ) -> Sequence[Tuple[CapacityPlan, CapacityDesires, float]]:
-    plans_by_regret = []
+    """Compatibility shim around ``regret_detailed``.
 
-    # Unfortunately has to be O(N^2) since regret isn't symmetric.
-    # We could create the entire NxN regret matrix and use
-    # einsum('ij->i') to quickly do a row wise sum, but that would
-    # require a _lot_ more memory than this ...
-    regret = np.zeros(len(capacity_plans), dtype=np.float64)
-    for i, proposed_plan in enumerate(capacity_plans):
-        for j, optimal_plan in enumerate(capacity_plans):
-            if j == i:
-                regret[j] = 0
-
-            regret[j] = sum(
-                model.regret(
-                    regret_params=regret_params,
-                    optimal_plan=optimal_plan[1],
-                    proposed_plan=proposed_plan[1],
-                ).values()
-            )
-        plans_by_regret.append(
-            (proposed_plan[1], proposed_plan[0], np.einsum("i->", regret))
+    Adapts the new typed API to the legacy 3-tuple shape that
+    ``ComposedExplanation.regret_clusters`` and downstream consumers
+    still expect. New code should call ``regret_detailed`` directly.
+    """
+    sampled_plans = [
+        SampledPlan(
+            sample=_sample_ref_for_desires(d, i),
+            desires=d,
+            plan=p,
         )
-
-    plans_by_regret.sort(key=lambda p: p[2])
-    return plans_by_regret
+        for i, (d, p) in enumerate(capacity_plans)
+    ]
+    candidates: Sequence[RegretCandidate] = regret_detailed(
+        sampled_plans, regret_params, model
+    )
+    return [(c.plan, c.desires, c.total_regret) for c in candidates]
 
 
 def _add_requirement(
@@ -465,6 +549,82 @@ def _resolve_cluster_instances(desires: CapacityDesires) -> None:
         for cap in cluster_list:
             if cap.cluster_instance is None and cap.cluster_instance_name:
                 cap.cluster_instance = shapes.instance(cap.cluster_instance_name)
+
+
+def _collect_composed_regret_candidates(
+    root: Optional[ComposedExplanation],
+) -> Sequence[RegretCandidate]:
+    """Reassemble composed ``RegretCandidate`` list from the tree.
+
+    ``ComposedExplanation.regret_clusters`` stores ``(plan, desires,
+    total_regret)`` 3-tuples (legacy back-compat shape). We wrap each
+    tuple as a ``RegretCandidate`` with a deterministically synthesized
+    ``SampleRef`` and, when the tree has multiple sub-models, merge
+    them positionally so the resulting candidates correspond to the
+    composed (merged) plans surfaced as ``plan.least_regret``.
+    """
+    if root is None:
+        return []
+    per_sub: List[List[RegretCandidate]] = []
+    for node in walk_explanations(root):
+        wrapped: List[RegretCandidate] = []
+        for i, (plan, sub_desires, total) in enumerate(node.regret_clusters):
+            wrapped.append(
+                RegretCandidate(
+                    plan=plan,
+                    desires=sub_desires,
+                    total_regret=total,
+                    sample=_sample_ref_for_desires(sub_desires, i),
+                )
+            )
+        if wrapped:
+            per_sub.append(wrapped)
+    if not per_sub:
+        return []
+    if len(per_sub) == 1:
+        return per_sub[0]
+    return merge_regret_candidates_positional(per_sub)
+
+
+def _build_explanation_tree(
+    root_model: str,
+    desires_by_model: Dict[str, CapacityDesires],
+    excuses_by_model: Dict[str, Sequence[Excuse]],
+    regret_clusters_by_model: Dict[
+        str, Sequence[Tuple[CapacityPlan, CapacityDesires, float]]
+    ],
+    parent_by_model: Dict[str, Optional[str]],
+) -> Optional[ComposedExplanation]:
+    """Assemble a ComposedExplanation tree from flat per-model accumulators.
+
+    Empty defaults (no excuses, no regret clusters, no children) are
+    omitted from each node's kwargs so ``ExcludeUnsetModel`` keeps them
+    unset and out of JSON dumps.
+    """
+    if root_model not in desires_by_model:
+        return None
+
+    children_of: Dict[Optional[str], List[str]] = {}
+    for child, parent in parent_by_model.items():
+        children_of.setdefault(parent, []).append(child)
+
+    def _node(name: str) -> ComposedExplanation:
+        kwargs: Dict[str, Any] = {
+            "model_name": name,
+            "desires": desires_by_model[name],
+        }
+        excuses = excuses_by_model.get(name)
+        if excuses:
+            kwargs["excuses"] = excuses
+        regret_clusters = regret_clusters_by_model.get(name)
+        if regret_clusters:
+            kwargs["regret_clusters"] = regret_clusters
+        kid_names = children_of.get(name, [])
+        if kid_names:
+            kwargs["children"] = [_node(k) for k in kid_names]
+        return ComposedExplanation(**kwargs)
+
+    return _node(root_model)
 
 
 class CapacityPlanner:
@@ -720,6 +880,7 @@ class CapacityPlanner:
         max_results_per_family: int = 1,
         planner_arguments: Optional[PlannerArguments] = None,
     ) -> ExplainedPlans:
+        # pylint: disable=too-many-locals
         """Like plan_certain() but returns excuses and family graph too."""
         if model_name not in self._models:
             raise ValueError(
@@ -739,6 +900,7 @@ class CapacityPlanner:
 
         all_plans: List[Sequence[CapacityPlan]] = []
         all_excuses: List[Excuse] = []
+        model_explanations: Dict[str, ModelExplanation] = {}
 
         for sub_model, sub_desires in self._sub_models(
             model_name=model_name,
@@ -759,6 +921,13 @@ class CapacityPlanner:
             )
             if sub_result.plans:
                 all_plans.append(sub_result.plans)
+                explanation = self._models[sub_model].explain_plan(
+                    plan=sub_result.plans[0],
+                    desires=sub_desires,
+                    extra_model_arguments=extra_model_arguments,
+                )
+                if explanation is not None:
+                    model_explanations[sub_model] = explanation
             all_excuses.extend(sub_result.excuses)
 
         plans = (
@@ -776,13 +945,27 @@ class CapacityPlanner:
         # a full RegionContext (which would do unnecessary deep-copies of services).
         hardware = self._shapes.region(region)
         model = self._models[model_name]
-        graph = FamilyGraph.build(excuses, hardware, model.preferred_families())
-
-        return ExplainedPlans(
-            plans=plans,
-            excuses=excuses,
-            family_graph=graph,
+        graph = FamilyGraph.build(
+            excuses,
+            hardware,
+            _resolve_preferred_families(model, extra_model_arguments),
+            derive_traits=model.derive_family_traits,
+            derive_edge=model.derive_family_edge,
         )
+
+        # Pass model_explanations only when populated: passing an empty
+        # dict marks the field as "set" in pydantic v2, which would make
+        # exclude_unset surface an empty dict in model_dump output (and
+        # break byte-stable baselines for models that don't override
+        # explain_plan).
+        explained_kwargs: Dict[str, Any] = {
+            "plans": plans,
+            "excuses": excuses,
+            "family_graph": graph,
+        }
+        if model_explanations:
+            explained_kwargs["model_explanations"] = model_explanations
+        return ExplainedPlans(**explained_kwargs)
 
     def _plan_certain(  # pylint: disable=too-many-positional-arguments
         self,
@@ -803,7 +986,7 @@ class CapacityPlanner:
 
         plans: List[CapacityPlan] = []
         excuses: List[Excuse] = []
-        pref_families = model.preferred_families()
+        pref_families = _resolve_preferred_families(model, extra_model_arguments)
         current_inst = current_instance_name(desires)
         for instance, drive, context in self.generate_scenarios(
             model, region, desires, num_regions, lifecycles, instance_families, drives
@@ -1084,6 +1267,58 @@ class CapacityPlanner:
             drive = Drive.get_managed_drive()
             yield instance, drive, context
 
+    def _simulate_sub_model(  # pylint: disable=too-many-positional-arguments
+        self,
+        *,
+        sub_model: str,
+        sub_desires: CapacityDesires,
+        region: str,
+        simulations: int,
+        num_regions: int,
+        extra_model_arguments: Dict[str, Any],
+        lifecycles: Sequence[Lifecycle],
+        instance_families: Optional[Sequence[str]],
+        drives: Optional[Sequence[str]],
+        pargs: "PlannerArguments",
+    ) -> Tuple[
+        List[Tuple[CapacityDesires, Sequence[CapacityPlan]]],
+        List[Excuse],
+    ]:
+        """Drive ``_plan_certain`` across simulated desires for one sub-model.
+
+        Extracted from ``plan()`` so the outer method stays under the
+        flake8 complexity budget. Returns the per-sim ``(desires, plans)``
+        list (used downstream for regret) and the per-sim excuses
+        decorated with sample provenance. Excuse accumulation is
+        unconditional now that ``plan()`` no longer carries an
+        ``explain`` flag — the cost is one dedup pass over ~30k excuses
+        on a 64-sim plan, verified byte-stable by capture-baseline.
+        """
+        model_plans: List[Tuple[CapacityDesires, Sequence[CapacityPlan]]] = []
+        model_excuses: List[Excuse] = []
+        for sim_index, sim_desires in enumerate(
+            model_desires(sub_desires, simulations)
+        ):
+            sim_result = self._plan_certain(
+                model_name=sub_model,
+                region=region,
+                desires=sim_desires,
+                num_results=1,
+                num_regions=num_regions,
+                extra_model_arguments=extra_model_arguments,
+                lifecycles=lifecycles,
+                instance_families=instance_families,
+                drives=drives,
+                planner_arguments=pargs,
+            )
+            model_plans.append((sim_desires, sim_result.plans))
+            sample = _sample_ref_for_desires(sim_desires, sim_index)
+            model_excuses.extend(
+                raw.model_copy(update={"example_samples": [sample]})
+                for raw in sim_result.excuses
+            )
+        return model_plans, model_excuses
+
     # pylint: disable=too-many-locals
     def plan(  # pylint: disable=too-many-positional-arguments
         self,
@@ -1099,7 +1334,6 @@ class CapacityPlanner:
         drives: Optional[Sequence[str]] = None,
         regret_params: Optional[CapacityRegretParameters] = None,
         extra_model_arguments: Optional[Dict[str, Any]] = None,
-        explain: bool = False,
         max_results_per_family: int = 1,
         planner_arguments: Optional[PlannerArguments] = None,
     ) -> UncertainCapacityPlan:
@@ -1130,32 +1364,27 @@ class CapacityPlanner:
         ] = {}
         desires_by_model: Dict[str, CapacityDesires] = {}
         excuses_by_model: Dict[str, List[Excuse]] = {}
-        for sub_model, sub_desires in self._sub_models(
+        parent_by_model: Dict[str, Optional[str]] = {}
+        for sub_model, sub_desires, parent_model in self._sub_models_with_parent(
             model_name=model_name,
             desires=desires,
             extra_model_arguments=extra_model_arguments,
         ):
             desires_by_model[sub_model] = sub_desires
-            model_plans: List[Tuple[CapacityDesires, Sequence[CapacityPlan]]] = []
-            model_excuses: List[Excuse] = []
-            for sim_desires in model_desires(sub_desires, simulations):
-                sim_result = self._plan_certain(
-                    model_name=sub_model,
-                    region=region,
-                    desires=sim_desires,
-                    num_results=1,
-                    num_regions=num_regions,
-                    extra_model_arguments=extra_model_arguments,
-                    lifecycles=lifecycles,
-                    instance_families=instance_families,
-                    drives=drives,
-                    planner_arguments=pargs,
-                )
-                model_plans.append((sim_desires, sim_result.plans))
-                if explain:
-                    model_excuses.extend(sim_result.excuses)
-            if explain:
-                excuses_by_model[sub_model] = model_excuses
+            parent_by_model[sub_model] = parent_model
+            model_plans, model_excuses = self._simulate_sub_model(
+                sub_model=sub_model,
+                sub_desires=sub_desires,
+                region=region,
+                simulations=simulations,
+                num_regions=num_regions,
+                extra_model_arguments=extra_model_arguments,
+                lifecycles=lifecycles,
+                instance_families=instance_families,
+                drives=drives,
+                pargs=pargs,
+            )
+            excuses_by_model[sub_model] = model_excuses
             regret_clusters_by_model[sub_model] = _regret(
                 capacity_plans=[
                     (sim_desires, plan[0]) for sim_desires, plan in model_plans if plan
@@ -1214,33 +1443,156 @@ class CapacityPlanner:
             instance_families=instance_families,
         )
 
-        result = UncertainCapacityPlan(
+        dedup_excuses_by_model: Dict[str, Sequence[Excuse]] = {
+            model: deduplicate_excuses(excuses)
+            for model, excuses in excuses_by_model.items()
+            if excuses
+        }
+
+        return UncertainCapacityPlan(
             requirements=final_requirement,
             least_regret=least_regret,
             mean=mean_plan,
             percentiles=percentile_plans,
             explanation=PlanExplanation(
                 regret_params=regret_params,
-                desires_by_model={
-                    model: desires.merge_with(
-                        self._models[model].default_desires(
-                            desires_by_model[model], extra_model_arguments
-                        )
-                    )
-                    for model in regret_clusters_by_model
-                },
+                root=_build_explanation_tree(
+                    root_model=model_name,
+                    desires_by_model=desires_by_model,
+                    excuses_by_model=dedup_excuses_by_model,
+                    regret_clusters_by_model=regret_clusters_by_model,
+                    parent_by_model=parent_by_model,
+                ),
             ),
         )
-        if explain:
-            result.explanation.regret_clusters_by_model = regret_clusters_by_model
-            result.explanation.excuses_by_model = {
-                model: deduplicate_excuses(excuses)
-                for model, excuses in excuses_by_model.items()
-                if excuses
-            }
-            result.explanation.context["regret"] = least_regret
 
-        return result
+    def plan_explained(  # pylint: disable=too-many-positional-arguments,too-many-locals
+        self,
+        model_name: str,
+        region: str,
+        desires: CapacityDesires,
+        percentiles: Tuple[int, ...] = (5, 50, 95),
+        simulations: Optional[int] = None,
+        num_results: Optional[int] = None,
+        num_regions: int = 3,
+        lifecycles: Optional[Sequence[Lifecycle]] = None,
+        instance_families: Optional[Sequence[str]] = None,
+        drives: Optional[Sequence[str]] = None,
+        regret_params: Optional[CapacityRegretParameters] = None,
+        extra_model_arguments: Optional[Dict[str, Any]] = None,
+        max_results_per_family: int = 1,
+        planner_arguments: Optional[PlannerArguments] = None,
+        considered_alternatives_cap: int = 10,
+    ) -> ExplainedUncertainPlans:
+        """Run ``plan()`` and surface typed explainability around it.
+
+        Wraps the standard ``UncertainCapacityPlan`` with topology-
+        aggregated regret summaries, considered-alternative summaries,
+        a deduplicated excuse summary, a per-region family graph
+        (using the root model's ``derive_family_traits`` and
+        ``derive_family_edge`` hooks), and any per-sub-model
+        ``ModelExplanation`` payloads.
+        """
+        if model_name not in self._models:
+            raise ValueError(
+                f"model_name={model_name} does not exist. "
+                f"Try {sorted(list(self._models.keys()))}"
+            )
+
+        extra_model_arguments = extra_model_arguments or {}
+
+        plan_result = self.plan(
+            model_name=model_name,
+            region=region,
+            desires=desires,
+            percentiles=percentiles,
+            simulations=simulations,
+            num_results=num_results,
+            num_regions=num_regions,
+            lifecycles=lifecycles,
+            instance_families=instance_families,
+            drives=drives,
+            regret_params=regret_params,
+            extra_model_arguments=extra_model_arguments,
+            max_results_per_family=max_results_per_family,
+            planner_arguments=planner_arguments,
+        )
+
+        composed_candidates = _collect_composed_regret_candidates(
+            plan_result.explanation.root
+        )
+        least_regret_summaries = (
+            summaries_for_least_regret(plan_result.least_regret, composed_candidates)
+            if composed_candidates
+            else []
+        )
+        selected_topologies = {topology_signature(p) for p in plan_result.least_regret}
+        considered_alternatives = considered_alternative_summaries(
+            composed_candidates,
+            selected_topologies,
+            cap=considered_alternatives_cap,
+        )
+
+        excuse_summary: List[Excuse] = []
+        for node in walk_explanations(plan_result.explanation.root):
+            excuse_summary.extend(node.excuses)
+        excuse_summary = list(deduplicate_excuses(excuse_summary))
+
+        hardware = self._shapes.region(region)
+        root_model = self._models[model_name]
+        family_graph = FamilyGraph.build(
+            excuse_summary,
+            hardware,
+            _resolve_preferred_families(root_model, extra_model_arguments),
+            derive_traits=root_model.derive_family_traits,
+            derive_edge=root_model.derive_family_edge,
+        )
+
+        model_explanations = self._collect_model_explanations(
+            model_name=model_name,
+            chosen_plan=plan_result.least_regret[0]
+            if plan_result.least_regret
+            else None,
+            desires=desires,
+            extra_model_arguments=extra_model_arguments,
+        )
+
+        kwargs: Dict[str, Any] = {
+            "plan": plan_result,
+            "least_regret_summaries": least_regret_summaries,
+            "considered_alternatives": considered_alternatives,
+            "excuse_summary": excuse_summary,
+            "family_graph": family_graph,
+        }
+        if model_explanations:
+            kwargs["model_explanations"] = model_explanations
+        return ExplainedUncertainPlans(**kwargs)
+
+    def _collect_model_explanations(
+        self,
+        *,
+        model_name: str,
+        chosen_plan: Optional[CapacityPlan],
+        desires: CapacityDesires,
+        extra_model_arguments: Dict[str, Any],
+    ) -> Dict[str, ModelExplanation]:
+        """Call ``explain_plan`` per sub-model on the chosen plan."""
+        if chosen_plan is None:
+            return {}
+        results: Dict[str, ModelExplanation] = {}
+        for sub_model, sub_desires in self._sub_models(
+            model_name=model_name,
+            desires=desires,
+            extra_model_arguments=extra_model_arguments,
+        ):
+            explanation = self._models[sub_model].explain_plan(
+                plan=chosen_plan,
+                desires=sub_desires,
+                extra_model_arguments=extra_model_arguments,
+            )
+            if explanation is not None:
+                results[sub_model] = explanation
+        return results
 
     def _sub_models(
         self,
@@ -1248,11 +1600,36 @@ class CapacityPlanner:
         desires: CapacityDesires,
         extra_model_arguments: Dict[str, Any],
     ) -> Generator[Tuple[str, CapacityDesires], None, None]:
-        queue: List[Tuple[CapacityDesires, str]] = [(desires, model_name)]
-        models_used = []
+        """Thin wrapper over ``_sub_models_with_parent`` that drops parent.
+
+        Retained so callers that don't need the compose_with parent
+        relationship (``plan_certain_explained``, ``_plan_percentiles``,
+        ``_get_model_costs``) keep their existing two-tuple iteration.
+        """
+        for sub_model, sub_desires, _parent in self._sub_models_with_parent(
+            model_name, desires, extra_model_arguments
+        ):
+            yield sub_model, sub_desires
+
+    def _sub_models_with_parent(
+        self,
+        model_name: str,
+        desires: CapacityDesires,
+        extra_model_arguments: Dict[str, Any],
+    ) -> Generator[Tuple[str, CapacityDesires, Optional[str]], None, None]:
+        """Traverse the compose_with graph, exposing each node's parent.
+
+        Yields ``(sub_model, sub_desires, parent_model_or_None)`` in the
+        same order as the legacy ``_sub_models``. Parent is ``None`` for
+        the root model.
+        """
+        queue: List[Tuple[CapacityDesires, str, Optional[str]]] = [
+            (desires, model_name, None)
+        ]
+        models_used: List[str] = []
 
         while queue:
-            parent_desires, sub_model = queue.pop()
+            parent_desires, sub_model, parent_model = queue.pop()
             # prevent infinite loop of models for now
             if sub_model in models_used:
                 continue
@@ -1268,14 +1645,14 @@ class CapacityPlanner:
             # the user requirement
             queue.extend(
                 [
-                    (modify_child_desires(desires), child_model)
+                    (modify_child_desires(desires), child_model, sub_model)
                     for child_model, modify_child_desires in self._models[
                         sub_model
                     ].compose_with(desires, extra_model_arguments)
                 ]
             )
 
-            yield sub_model, sub_desires
+            yield sub_model, sub_desires, parent_model
 
 
 planner = CapacityPlanner()
